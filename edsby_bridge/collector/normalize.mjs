@@ -467,7 +467,9 @@ export function supersedeSchedules(assessments, posts) {
 // ---------------------------------------------------------------------------
 
 function fileOf(item) {
-  const c = item?.Content ?? item?.content ?? item?.file?.Content ?? null;
+  // A folder lists a file as item.file = {ContentName, ContentType, ContentSize};
+  // other views wrap it one level deeper.
+  const c = item?.file?.ContentName ? item.file : item?.Content ?? item?.content ?? item?.file?.Content ?? null;
   if (!c || !(c.ContentName || c.contentName)) return null;
   return {
     name: c.ContentName ?? c.contentName ?? '',
@@ -487,6 +489,9 @@ export function readClassFolder(body, containerNid) {
   const data = sliceData(body);
   const items = Object.values(data?.body?.table?.itemSource?.item ?? {});
   return items
+    // A folder lists a way back up to its class (nodetype 3, subtype 2): a
+    // link, not something in the folder.
+    .filter((it) => !(String(it.nodetype) === '3' && String(it.nodesubtype) === '2'))
     .map((it) => {
       const file = fileOf(it);
       const subtype = String(it.nodesubtype ?? '');
@@ -547,7 +552,7 @@ function nidOf(url) {
   return /\/node\.json\/(\d+)/.exec(url)?.[1] ?? null;
 }
 
-export function normalizeCapture(responses, { host = '', now = Date.now() } = {}) {
+export function normalizeCapture(responses, { host = '', now = Date.now(), storedFiles = new Set() } = {}) {
   const classes = new Map();
   const timetable = [];
   const events = new Map();
@@ -581,7 +586,7 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
         const p = readPost(item);
         if (p.nid) posts.set(p.nid, p);
       }
-    } else if (view === 'ClassFolder') {
+    } else if (view === 'ClassFolder' || view === 'Folder') {
       for (const it of readClassFolder(body, nidOf(r.url))) libraryItems.set(it.nid, it);
     } else if (view === 'MyWork') {
       const work = readMyWork(body, nidOf(r.url));
@@ -601,7 +606,11 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
   for (const t of timetable) if (Number(t.classNid) < 0 && byCode.has(t.code)) t.classNid = byCode.get(t.code);
 
   const postList = [...posts.values()]
-    .map((p) => ({ ...p, className: p.className || classes.get(p.classNid)?.name || '' }))
+    .map((p) => ({
+      ...p,
+      className: p.className || classes.get(p.classNid)?.name || '',
+      files: p.files.map((f) => ({ ...f, stored: storedFiles.has(f.nid) })),
+    }))
     .sort((a, b) => String(b.postedAt).localeCompare(String(a.postedAt)));
   const byDate = (a, b) => String(a.date).localeCompare(String(b.date));
   const { current, superseded } = supersedeSchedules([...edsbyAssessments, ...postList.flatMap(readAssessmentDates)], postList);
@@ -613,7 +622,7 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
     return parent && depth < 12 ? classOf(parent, depth + 1) : '';
   };
   const library = [...libraryItems.values()]
-    .map((it) => ({ ...it, classNid: classOf(it.parentNid) || it.parentNid }))
+    .map((it) => ({ ...it, classNid: classOf(it.parentNid) || it.parentNid, stored: it.kind === 'file' && storedFiles.has(it.nid) }))
     .sort((a, b) => a.classNid.localeCompare(b.classNid) || a.name.localeCompare(b.name, undefined, { numeric: true }));
 
   return {

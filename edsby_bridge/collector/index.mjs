@@ -35,7 +35,7 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
 const HOST = String(options.edsby_host || '')
@@ -244,7 +244,9 @@ async function push(reason) {
     responseCount: responses.length,
     fetchLog: lastFetchLog,
     addressLog: signedIn ? addressLog : [],
-    normalized: signedIn ? normalizeCapture(responses, { host: HOST }) : null,
+    downloadLog: lastDownloadLog,
+    storedFileCount: storedFiles.size,
+    normalized: signedIn ? normalizeCapture(responses, { host: HOST, storedFiles: new Set(storedFiles.keys()) }) : null,
     responses,
   };
   const bytes = JSON.stringify(payload).length;
@@ -318,6 +320,7 @@ async function refresh() {
     await page.goto(home, { waitUntil: 'networkidle', timeout: 90_000 });
     await page.waitForTimeout(5_000);
     await lookAtEveryClass(page);
+    await storeNewFiles();
   } catch (err) {
     log(`the regular look did not finish: ${err.message}`);
   } finally {
@@ -397,7 +400,7 @@ async function lookAtEveryClass(page) {
   for (let depth = 0; depth < MAX_FOLDER_DEPTH; depth++) {
     const folders = [];
     for (const entry of captured.values()) {
-      if (!/xds=ClassFolder/.test(entry.url)) continue;
+      if (!/xds=(ClassFolder|Folder)\b/.test(entry.url)) continue;
       let body = null;
       try {
         body = JSON.parse(entry.body);
@@ -413,13 +416,97 @@ async function lookAtEveryClass(page) {
     const next = [...new Set(folders)].slice(0, Math.max(0, room));
     if (next.length === 0) break;
     for (const nid of next) opened.add(nid);
-    folderLog.push(...(await fetchViews(page, next.map((nid) => `/core/node.json/${nid}?xds=ClassFolder`))));
+    // A class's top level answers ClassFolder; a folder inside it answers
+    // Folder, which is what Edsby's own panel asks for when one is opened.
+    // Asking a folder for ClassFolder is refused.
+    folderLog.push(...(await fetchViews(page, next.map((nid) => `/core/node.json/${nid}?xds=Folder`))));
     await page.waitForTimeout(3_000);
   }
 
   lastFetchLog = [...log1, ...folderLog];
   const ok = lastFetchLog.filter((f) => f.status === 200 && /json/.test(f.type)).length;
   log(`looked at ${classes.length} classes and ${folderLog.length} library folders: ${ok} of ${lastFetchLog.length} views answered`);
+}
+
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+
+const STORED_FILES_PATH = process.env.STORED_FILES ?? '/data/stored-files.json';
+/** Edsby file id → when it went to the relay. Survives restarts, so nothing is sent twice. */
+const storedFiles = new Map(
+  Object.entries(await fs.readFile(STORED_FILES_PATH, 'utf8').then(JSON.parse).catch(() => ({})))
+);
+let lastDownloadLog = [];
+
+const MAX_FILE_BYTES = 20_000_000;
+const MAX_FILES_PER_LOOK = 25;
+const MAX_BYTES_PER_LOOK = 60_000_000;
+
+/**
+ * Each new library file and post attachment, fetched once and stored on the
+ * relay for the study app to read.
+ *
+ * Fetched with the browser's own session through Playwright's request context
+ * — the same cookies the signed-in page uses, without drawing anything — from
+ * the address Edsby's viewer uses. A handful per look, a moment apart, and
+ * never again once stored. A reply that is a web page rather than a file means
+ * Edsby did not hand it over, and the rest wait for the next look.
+ */
+async function storeNewFiles() {
+  if (!SECRET || !RELAY || !signedIn) return;
+  const n = normalizeCapture([...captured.values()], { host: HOST });
+  const wanted = new Map();
+  for (const it of n.library) if (it.kind === 'file' && it.file) wanted.set(it.nid, it.file);
+  for (const p of n.posts) for (const f of p.files) if (f.nid) wanted.set(f.nid, f);
+
+  const queue = [...wanted.entries()].filter(([nid]) => !storedFiles.has(nid));
+  const results = [];
+  let sentBytes = 0;
+  for (const [nid, meta] of queue) {
+    if (results.length >= MAX_FILES_PER_LOOK || sentBytes >= MAX_BYTES_PER_LOOK) break;
+    if (meta.bytes > MAX_FILE_BYTES) {
+      results.push({ nid, name: meta.name, outcome: 'too large to store', bytes: meta.bytes });
+      continue;
+    }
+    try {
+      const res = await context.request.get(
+        `https://${HOST}/core/nodedl/${nid}?field=file&xds=fileView&size=orig&attach=1`,
+        { timeout: 90_000, headers: { referer: `https://${HOST}/` } }
+      );
+      const type = res.headers()['content-type'] ?? '';
+      const body = await res.body();
+      if (!res.ok() || /text\/html/i.test(type) || body.length === 0) {
+        results.push({ nid, name: meta.name, outcome: `Edsby answered ${res.status()} ${type}`.trim() });
+        // A web page instead of a file is Edsby refusing, not one bad file.
+        if (/text\/html/i.test(type)) break;
+        continue;
+      }
+      const put = await fetch(`${RELAY}/edsby/file/${encodeURIComponent(SECRET)}/${nid}`, {
+        method: 'PUT',
+        headers: {
+          'content-type': meta.type || type || 'application/octet-stream',
+          'x-file-name': encodeURIComponent(meta.name || String(nid)),
+          'user-agent': `edsby-bridge/${VERSION}`,
+        },
+        body,
+      });
+      if (!put.ok) {
+        results.push({ nid, name: meta.name, outcome: `relay refused ${put.status}` });
+        continue;
+      }
+      storedFiles.set(nid, Date.now());
+      sentBytes += body.length;
+      results.push({ nid, name: meta.name, outcome: 'stored', bytes: body.length });
+    } catch (err) {
+      results.push({ nid, name: meta.name, outcome: `failed: ${err?.message ?? err}` });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+  await fs.writeFile(STORED_FILES_PATH, JSON.stringify(Object.fromEntries(storedFiles))).catch(() => {});
+  lastDownloadLog = results;
+  const stored = results.filter((l) => l.outcome === 'stored').length;
+  if (queue.length) log(`files: ${stored} stored this look, ${queue.length - stored} still waiting, ${storedFiles.size} stored in all`);
 }
 
 /**

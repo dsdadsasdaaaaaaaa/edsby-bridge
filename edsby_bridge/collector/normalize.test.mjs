@@ -254,3 +254,15 @@ test("My Work gives units, curriculum and strands, and passes grades through unt
   assert.equal(w.gradedCount, 1);
   assert.deepEqual(w.grades, { g1: { anything: 'as Edsby sends it' } });
 });
+
+test('a folder opened with xds=Folder lists its files, without the link back to the class', () => {
+  const body = { slices: [{ data: { title: 'Algebraic Expressions', body: { table: { itemSource: { item: {
+    a: { nid: 31, rfrom: 11, date: '2026-09-14 16:43:40', creatorname: 'Mr. A', name: 'Lesson notes.pdf', nodetype: 5, nodesubtype: 0,
+         file: { ContentType: 'application/pdf', ContentName: 'Lesson notes.pdf', ContentSize: 371211 } },
+    back: { nid: 5, rfrom: 5, name: 'MCR3U-05', nodetype: 3, nodesubtype: 2 },
+  } } } } } }] };
+  const got = readClassFolder(body, '11');
+  assert.equal(got.length, 1);
+  assert.deepEqual([got[0].kind, got[0].name, got[0].parentNid], ['file', 'Lesson notes.pdf', '11']);
+  assert.deepEqual(got[0].file, { name: 'Lesson notes.pdf', type: 'application/pdf', bytes: 371211 });
+});
