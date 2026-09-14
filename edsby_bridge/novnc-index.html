@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Edsby Bridge</title>
+<script>
+  // Home Assistant serves this page under a per-session path
+  // (/api/hassio_ingress/<token>/), and noVNC builds its websocket address
+  // from the site root. Hand it the path it is really at.
+  const base = location.pathname.replace(/[^/]*$/, '');
+  const path = (base + 'websockify').replace(/^\//, '');
+  location.replace(base + 'vnc.html?autoconnect=1&reconnect=1&resize=scale&path=' + encodeURIComponent(path));
+</script>

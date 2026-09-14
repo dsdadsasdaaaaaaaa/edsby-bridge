@@ -1,0 +1,23 @@
+name: Edsby Bridge
+version: "0.1.0"
+slug: edsby_bridge
+description: Keeps a signed-in Edsby session and sends what your classes post to DayFlow.
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+ingress: true
+ingress_port: 6080
+panel_icon: mdi:school
+panel_title: Edsby
+options:
+  edsby_host: tchat.edsby.com
+  relay_url: https://dayflow-inbox.giveawaybot1225.workers.dev
+  relay_secret: ""
+  interval_minutes: 180
+schema:
+  edsby_host: str
+  relay_url: url
+  relay_secret: password
+  interval_minutes: int(30,1440)
