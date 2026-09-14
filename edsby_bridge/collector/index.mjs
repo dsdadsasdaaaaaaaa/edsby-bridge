@@ -23,7 +23,7 @@
  */
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
-import { SKIP_PATH, cleanUrl, desktopUserAgent, isSignedInState, looksLikeJson, redactBody } from './redact.mjs';
+import { SKIP_PATH, captureKey, cleanUrl, desktopUserAgent, isSignedInState, looksLikeJson, redactBody, skippedView } from './redact.mjs';
 
 /** The engine's real version, for the browser identity Edsby is shown. */
 const CHROMIUM_VERSION = await fs
@@ -34,7 +34,7 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
 const HOST = String(options.edsby_host || '')
@@ -77,6 +77,7 @@ async function record(response) {
     const url = new URL(response.url());
     if (url.hostname !== HOST) return;
     if (SKIP_PATH.test(url.pathname)) return;
+    if (skippedView(response.url())) return;
     const request = response.request();
     const kind = request.resourceType();
     if (kind !== 'xhr' && kind !== 'fetch') return;
@@ -85,7 +86,7 @@ async function record(response) {
     if (!text || !looksLikeJson(contentType, text)) return;
 
     const clean = redactBody(text);
-    const key = `${request.method()} ${cleanUrl(response.url())}`;
+    const key = captureKey(request.method(), response.url());
     captured.delete(key); // re-insert so the newest sits last
     captured.set(key, {
       method: request.method(),

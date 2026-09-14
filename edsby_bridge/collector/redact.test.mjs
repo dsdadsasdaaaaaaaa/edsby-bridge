@@ -88,3 +88,48 @@ test('Edsby is shown an ordinary desktop Chrome of the real engine version', () 
   assert.match(ua, /Chrome\/153\.0\.0\.0 Safari/);
   assert.doesNotMatch(ua, /Headless|Testing/);
 });
+
+// ---- found on the first real capture, 14 September ----
+import { captureKey, skippedView } from './redact.mjs';
+
+test("Edsby's structure survives: key, code and state are data here, not secrets", () => {
+  const body = JSON.stringify({
+    slices: [{ data: {
+      fields: [{ context: 'parent', value: 'True', key: 'showDue' }],
+      course: { code: 'SPH3U-06', title: { text: 'Physics' } },
+      list: { role: 'list', state: 'open' },
+    } }],
+  });
+  const out = JSON.parse(redactBody(body));
+  const d = out.slices[0].data;
+  assert.equal(d.fields[0].key, 'showDue');
+  assert.equal(d.course.code, 'SPH3U-06');
+  assert.equal(d.list.state, 'open');
+});
+
+test('real credentials in bodies are still removed', () => {
+  const body = JSON.stringify({ apikey: 'AK1', config: false, _formkey: 'FK2', sessionId: 'S3', nested: { api_key: 'AK4', csrf: 'C5' } });
+  const out = redactBody(body);
+  for (const secret of ['AK1', 'FK2', 'S3', 'AK4', 'C5']) assert.ok(!out.includes(secret), `${secret} leaked: ${out}`);
+});
+
+test('a sign-in code in an address is still removed', () => {
+  const out = cleanUrl('https://tchat.edsby.com/p/x?code=OAUTHCODE&state=XYZSTATE&xds=Course');
+  assert.ok(!out.includes('OAUTHCODE') && !out.includes('XYZSTATE'), out);
+  assert.ok(out.includes('xds=Course'), out);
+});
+
+test("classmates' roster is never recorded", () => {
+  assert.equal(skippedView('https://tchat.edsby.com/core/node.json/221512202?xds=studentRoster&_source=window'), true);
+  assert.equal(skippedView('https://tchat.edsby.com/core/node.json/221512202?xds=CourseFeed'), false);
+  assert.equal(skippedView('https://tchat.edsby.com/core/node.json/170594147'), false);
+});
+
+test('reloading the same data replaces it rather than piling up', () => {
+  const a = captureKey('GET', 'https://tchat.edsby.com/core/node.json/?xds=bootstrap&_inval=1789398120397');
+  const b = captureKey('GET', 'https://tchat.edsby.com/core/node.json/?xds=bootstrap&_inval=1789398112406');
+  assert.equal(a, b);
+  const c = captureKey('GET', 'https://tchat.edsby.com/core/node.json/221512202?xds=CourseFeed');
+  const d = captureKey('GET', 'https://tchat.edsby.com/core/node.json/221512368?xds=CourseFeed');
+  assert.notEqual(c, d, 'two different classes must stay two captures');
+});
