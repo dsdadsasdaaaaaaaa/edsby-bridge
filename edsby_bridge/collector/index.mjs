@@ -24,7 +24,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 import { SKIP_PATH, captureKey, cleanUrl, desktopUserAgent, isSignedInState, looksLikeJson, redactBody, skippedView } from './redact.mjs';
-import { normalizeCapture, readClasses, stripLayout } from './normalize.mjs';
+import { normalizeCapture, readClassFolder, readClasses, stripLayout } from './normalize.mjs';
 
 /** The engine's real version, for the browser identity Edsby is shown. */
 const CHROMIUM_VERSION = await fs
@@ -35,7 +35,7 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.2.1';
+const VERSION = '0.3.0';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
 const HOST = String(options.edsby_host || '')
@@ -107,6 +107,37 @@ async function record(response) {
   }
 }
 
+/**
+ * The addresses Edsby loads, never their contents.
+ *
+ * How a file downloads or a folder opens is only learned by watching it
+ * happen, and the capture above keeps JSON alone. This keeps the rest as
+ * addresses — cleaned of anything secret — so opening something once in the
+ * panel is enough to see how it is fetched.
+ */
+const addressLog = [];
+const MAX_ADDRESSES = 150;
+function noteAddress(response) {
+  if (!signedIn) return;
+  try {
+    const url = new URL(response.url());
+    if (url.hostname !== HOST || SKIP_PATH.test(url.pathname)) return;
+    const kind = response.request().resourceType();
+    if (!['document', 'xhr', 'fetch', 'other', 'media'].includes(kind)) return;
+    addressLog.push({
+      at: Date.now(),
+      method: response.request().method(),
+      url: cleanUrl(response.url()),
+      status: response.status(),
+      type: response.headers()['content-type'] ?? '',
+      kind,
+    });
+    if (addressLog.length > MAX_ADDRESSES) addressLog.splice(0, addressLog.length - MAX_ADDRESSES);
+  } catch {
+    // nothing worth noting
+  }
+}
+
 function trim() {
   let total = 0;
   for (const entry of captured.values()) total += entry.bytes;
@@ -122,6 +153,8 @@ function trim() {
 // ---------------------------------------------------------------------------
 
 let signedIn = false;
+/** The student's own Edsby id, learned from the class list. */
+let studentNid = null;
 
 async function readSignedIn(page) {
   try {
@@ -143,12 +176,51 @@ async function updateSignedIn(reason) {
   signedIn = now;
   if (now) {
     log(`signed in (${reason}); taking a first look in 10 seconds`);
+    void notifyHomeAssistant(false);
     setTimeout(() => void refresh(), 10_000);
   } else {
     captured.clear();
     log(`not signed in (${reason}) — open the Edsby panel in Home Assistant and sign in`);
+    void notifyHomeAssistant(true);
+    void push('signed out');
   }
   return now;
+}
+
+const NOTIFICATION_ID = 'edsby_bridge_signed_out';
+
+/**
+ * Say so in Home Assistant when the session ends, and take it back when it
+ * returns.
+ *
+ * The first real session ended in the afternoon and nothing said so: the
+ * bridge kept looking every three hours, found a login page each time, and
+ * the only sign was an absence of new posts. A notification in the sidebar is
+ * where a person will actually see it.
+ */
+async function notifyHomeAssistant(signedOut) {
+  const token = process.env.SUPERVISOR_TOKEN;
+  if (!token) return;
+  const service = signedOut ? 'create' : 'dismiss';
+  const body = signedOut
+    ? {
+        notification_id: NOTIFICATION_ID,
+        title: 'Edsby Bridge is signed out',
+        message:
+          'Edsby ended the session, so class posts, test dates and libraries have stopped updating. ' +
+          'Open **Edsby** in the sidebar and sign in again, with **Keep me logged in** ticked.',
+      }
+    : { notification_id: NOTIFICATION_ID };
+  try {
+    const res = await fetch(`http://supervisor/core/api/services/persistent_notification/${service}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) log(`Home Assistant did not take the notification: ${res.status}`);
+  } catch (err) {
+    log(`could not reach Home Assistant for the notification: ${err?.message ?? err}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +243,7 @@ async function push(reason) {
     page: page ? { url: page.url().startsWith('http') ? cleanUrl(page.url()) : '', title: await page.title().catch(() => '') } : null,
     responseCount: responses.length,
     fetchLog: lastFetchLog,
+    addressLog: signedIn ? addressLog : [],
     normalized: signedIn ? normalizeCapture(responses, { host: HOST }) : null,
     responses,
   };
@@ -209,6 +282,7 @@ const context = await chromium.launchPersistentContext(PROFILE_DIR, {
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--window-position=0,0', '--window-size=1366,900'],
 });
 context.on('response', record);
+context.on('response', noteAddress);
 context.on('close', () => {
   log('browser closed');
   process.exit(0);
@@ -220,6 +294,7 @@ await first.goto(home, { waitUntil: 'networkidle', timeout: 60_000 }).catch((e) 
 log(`Edsby open at ${home}`);
 signedIn = await readSignedIn(first);
 log(signedIn ? 'signed in: yes (kept from last time)' : 'signed in: no — open the Edsby panel in Home Assistant and sign in');
+void notifyHomeAssistant(!signedIn);
 // Edsby is a single-page app: signing in does not always load a new page, so
 // the state is re-read on a short timer as well as on navigation.
 first.on('framenavigated', (frame) => {
@@ -260,29 +335,9 @@ async function refresh() {
  * Made from inside the signed-in page, one at a time and a moment apart, so to
  * Edsby it is the student opening their classes.
  */
-async function lookAtEveryClass(page) {
-  const list = [...captured.values()].find((c) => /xds=BaseStudentClasses/.test(c.url));
-  let classes = [];
-  let studentNid = null;
-  try {
-    const body = JSON.parse(list?.body ?? 'null');
-    classes = readClasses(body);
-    studentNid = body?.slices?.[0]?.data?.nid ?? null;
-  } catch {
-    // no class list yet; the next look will have one
-  }
-  if (classes.length === 0) {
-    log('no class list captured yet; looking at classes next time');
-    return;
-  }
-  const urls = classes.flatMap((c) => [
-    `/core/node.json/${c.nid}?xds=CourseFeed`,
-    `/core/node.json/${c.nid}?xds=CalendarPanel_Class`,
-  ]);
-  // Where Edsby keeps a student's assignments, by the name its own menu uses.
-  if (studentNid) urls.push(`/core/node.json/${studentNid}?xds=MyWork`);
-
-  lastFetchLog = await page.evaluate(async (list) => {
+/** Requests, one at a time and a moment apart, from inside the signed-in page. */
+async function fetchViews(page, urls) {
+  return page.evaluate(async (list) => {
     const out = [];
     for (const url of list) {
       try {
@@ -296,11 +351,96 @@ async function lookAtEveryClass(page) {
     }
     return out;
   }, urls);
-  // Let the last responses finish being recorded before anything is sent.
-  await page.waitForTimeout(3_000);
-  const ok = lastFetchLog.filter((f) => f.status === 200 && /json/.test(f.type)).length;
-  log(`looked at ${classes.length} classes: ${ok} of ${lastFetchLog.length} views answered`);
 }
+
+/** Most folders opened in one look. A library bigger than this finishes next time. */
+const MAX_FOLDERS_PER_LOOK = 60;
+const MAX_FOLDER_DEPTH = 4;
+
+/**
+ * Everything each class has: its feed, calendar, My Work, and library.
+ *
+ * These are the requests Edsby's own app makes when a class is opened.
+ * My Work is asked for per class — asking once for the student is refused —
+ * and a library is read a level at a time, opening each folder the way a
+ * person clicking through it would.
+ */
+async function lookAtEveryClass(page) {
+  const list = [...captured.values()].find((c) => /xds=BaseStudentClasses/.test(c.url));
+  let classes = [];
+  try {
+    const body = JSON.parse(list?.body ?? 'null');
+    classes = readClasses(body);
+    studentNid = body?.slices?.[0]?.data?.nid ?? studentNid;
+  } catch {
+    // no class list yet; the next look will have one
+  }
+  if (classes.length === 0) {
+    log('no class list captured yet; looking at classes next time');
+    return;
+  }
+
+  const log1 = await fetchViews(
+    page,
+    classes.flatMap((c) => [
+      `/core/node.json/${c.nid}?xds=CourseFeed`,
+      `/core/node.json/${c.nid}?xds=CalendarPanel_Class`,
+      `/core/node.json/${c.nid}?xds=MyWork&MyWork_active=assessments`,
+      `/core/node.json/${c.nid}?xds=ClassFolder`,
+    ])
+  );
+  await page.waitForTimeout(3_000);
+
+  // Then into the libraries, a level at a time.
+  const opened = new Set(classes.map((c) => c.nid));
+  const folderLog = [];
+  for (let depth = 0; depth < MAX_FOLDER_DEPTH; depth++) {
+    const folders = [];
+    for (const entry of captured.values()) {
+      if (!/xds=ClassFolder/.test(entry.url)) continue;
+      let body = null;
+      try {
+        body = JSON.parse(entry.body);
+      } catch {
+        continue;
+      }
+      const container = /\/node\.json\/(\d+)/.exec(entry.url)?.[1] ?? '';
+      for (const item of readClassFolder(body, container)) {
+        if (item.kind === 'folder' && !opened.has(item.nid)) folders.push(item.nid);
+      }
+    }
+    const room = MAX_FOLDERS_PER_LOOK - folderLog.length;
+    const next = [...new Set(folders)].slice(0, Math.max(0, room));
+    if (next.length === 0) break;
+    for (const nid of next) opened.add(nid);
+    folderLog.push(...(await fetchViews(page, next.map((nid) => `/core/node.json/${nid}?xds=ClassFolder`))));
+    await page.waitForTimeout(3_000);
+  }
+
+  lastFetchLog = [...log1, ...folderLog];
+  const ok = lastFetchLog.filter((f) => f.status === 200 && /json/.test(f.type)).length;
+  log(`looked at ${classes.length} classes and ${folderLog.length} library folders: ${ok} of ${lastFetchLog.length} views answered`);
+}
+
+/**
+ * A light touch every twenty minutes, so the session is not idle long enough
+ * to be ended. An open Edsby tab does the same.
+ */
+const KEEP_ALIVE_MS = 20 * 60_000;
+async function keepAlive() {
+  if (!signedIn || !studentNid) return;
+  const main = context.pages()[0];
+  if (!main) return;
+  try {
+    await main.evaluate(async (nid) => {
+      await fetch(`/core/node.json/${nid}?xds=scrollingNews`, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+    }, studentNid);
+  } catch {
+    // mid-navigation; the next touch will do
+  }
+  await updateSignedIn('keep-alive');
+}
+setInterval(() => void keepAlive(), KEEP_ALIVE_MS);
 
 setTimeout(() => void refresh(), 60_000);
 setInterval(() => void refresh(), INTERVAL_MS);

@@ -461,6 +461,80 @@ export function supersedeSchedules(assessments, posts) {
   return { current, superseded };
 }
 
+
+// ---------------------------------------------------------------------------
+// Class libraries and My Work
+// ---------------------------------------------------------------------------
+
+function fileOf(item) {
+  const c = item?.Content ?? item?.content ?? item?.file?.Content ?? null;
+  if (!c || !(c.ContentName || c.contentName)) return null;
+  return {
+    name: c.ContentName ?? c.contentName ?? '',
+    type: c.ContentType ?? c.contentType ?? '',
+    bytes: Number(c.ContentSize ?? c.contentSize ?? 0) || 0,
+  };
+}
+
+/**
+ * One level of a class library: what a ClassFolder view lists.
+ *
+ * Edsby answers the same view for a class (its library's top level) and for a
+ * folder inside it, and every entry names its parent in `rfrom`, which is how
+ * a folder three levels down still knows its class.
+ */
+export function readClassFolder(body, containerNid) {
+  const data = sliceData(body);
+  const items = Object.values(data?.body?.table?.itemSource?.item ?? {});
+  return items
+    .map((it) => {
+      const file = fileOf(it);
+      const subtype = String(it.nodesubtype ?? '');
+      return {
+        nid: String(it.nid ?? ''),
+        parentNid: String(it.rfrom ?? containerNid ?? ''),
+        name: String(it.title?.name ?? it.name ?? file?.name ?? '').trim(),
+        kind: subtype === '16' ? 'folder' : file ? 'file' : 'item',
+        addedAt: edsbyInstant(it.date),
+        addedBy: it.creatorname ?? '',
+        file,
+      };
+    })
+    .filter((it) => it.nid);
+}
+
+function oneLine(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * A class's My Work: its units, the curriculum expectations it covers, how it
+ * is marked, and whatever has been graded.
+ *
+ * Grades are passed through as Edsby sends them, not interpreted: none had
+ * been entered when this was written, so their shape has never been seen, and
+ * guessing at a mark would be worse than handing it over untouched.
+ */
+export function readMyWork(body, classNid) {
+  const data = sliceData(body);
+  const load = data?.loaddata ?? {};
+  const gb = load.gradebook ?? {};
+  const grades = load.grades && typeof load.grades === 'object' ? load.grades : {};
+  return {
+    classNid: String(classNid ?? data?.nid ?? ''),
+    courseCode: gb.CourseID ?? data?.courseTitle ?? '',
+    units: Object.values(gb.terms ?? {})
+      .map((t) => ({ nid: String(t.nid ?? ''), name: oneLine(t.name), start: edsbyInstant(t.sdate) }))
+      .sort((a, b) => String(a.start).localeCompare(String(b.start))),
+    strands: (gb.strands ?? []).map((st) => ({ key: st.key ?? '', name: st.name ?? '' })),
+    curriculum: Object.values(gb.learningstandards ?? {})
+      .map((ls) => ({ code: ls.fullcode ?? ls.name ?? '', title: oneLine(ls.title), level: ls.type === 'Destination' ? 'overall' : 'specific' }))
+      .sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true })),
+    gradedCount: Object.keys(grades).length,
+    grades,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The whole capture
 // ---------------------------------------------------------------------------
@@ -479,6 +553,8 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
   const events = new Map();
   const posts = new Map();
   const edsbyAssessments = [];
+  const libraryItems = new Map();
+  const mywork = new Map();
 
   for (const r of responses) {
     if (r.status !== 200) continue;
@@ -505,6 +581,11 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
         const p = readPost(item);
         if (p.nid) posts.set(p.nid, p);
       }
+    } else if (view === 'ClassFolder') {
+      for (const it of readClassFolder(body, nidOf(r.url))) libraryItems.set(it.nid, it);
+    } else if (view === 'MyWork') {
+      const work = readMyWork(body, nidOf(r.url));
+      if (work.classNid) mywork.set(work.classNid, work);
     } else if (view === 'CourseFeed') {
       const feedNid = nidOf(r.url);
       for (const item of Object.values(sliceData(body)?.item ?? {})) {
@@ -525,6 +606,16 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
   const byDate = (a, b) => String(a.date).localeCompare(String(b.date));
   const { current, superseded } = supersedeSchedules([...edsbyAssessments, ...postList.flatMap(readAssessmentDates)], postList);
 
+  // Each library entry learns its class by walking up through its parents.
+  const classOf = (nid, depth = 0) => {
+    if (classes.has(nid)) return nid;
+    const parent = libraryItems.get(nid)?.parentNid;
+    return parent && depth < 12 ? classOf(parent, depth + 1) : '';
+  };
+  const library = [...libraryItems.values()]
+    .map((it) => ({ ...it, classNid: classOf(it.parentNid) || it.parentNid }))
+    .sort((a, b) => a.classNid.localeCompare(b.classNid) || a.name.localeCompare(b.name, undefined, { numeric: true }));
+
   return {
     schema: 1,
     host,
@@ -535,6 +626,8 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
     posts: postList,
     assessments: current.sort(byDate),
     supersededAssessments: superseded.sort(byDate),
+    library,
+    mywork: [...mywork.values()],
   };
 }
 

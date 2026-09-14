@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { edsbyInstant, htmlToText, normalizeCapture, readAssessmentDates, readLessonSections, readPost, stripLayout, supersedeSchedules } from './normalize.mjs';
+import { edsbyInstant, htmlToText, normalizeCapture, readAssessmentDates, readClassFolder, readLessonSections, readMyWork, readPost, stripLayout, supersedeSchedules } from './normalize.mjs';
 
 // Shapes copied from real Edsby responses; the words are made up.
 const post = (text, postedAt = '2026-09-14T12:57:28Z', extra = {}) => ({ nid: 'p1', classNid: 'c1', className: 'Computer Science', postedAt, text, ...extra });
@@ -201,4 +201,56 @@ test('the same schedule heading in two different classes is two schedules', () =
   const a = { nid: 'a', classNid: 'c1', className: 'A', postedAt: '2026-09-01T00:00:00Z', text: 'Test Schedule:\nOctober 1st' };
   const b = { nid: 'b', classNid: 'c2', className: 'B', postedAt: '2026-09-05T00:00:00Z', text: 'Test Schedule:\nOctober 8th' };
   assert.equal(supersedeSchedules([a, b].flatMap(readAssessmentDates), [a, b]).current.length, 2);
+});
+
+// ---- class libraries and My Work, from the third real capture ----
+
+const folderBody = (items, title = 'MCR3U-05') => JSON.stringify({ slices: [{ data: { title, body: { table: { itemSource: { item: items } } } } }] });
+
+test('a library level lists its folders and files, each knowing its parent', () => {
+  const body = JSON.parse(folderBody({
+    r1: { nid: 11, rfrom: 5, date: '2026-08-31 14:45:42', creatorname: 'Mr. A', name: 'Quadratic Functions', nodetype: 3, nodesubtype: 16, title: { name: 'Quadratic Functions' } },
+    r2: { nid: 12, rfrom: 5, date: '2026-09-02 10:00:00', creatorname: 'Mr. A', nodetype: 4, nodesubtype: 0, Content: { ContentName: 'Unit 1 notes.pdf', ContentType: 'application/pdf', ContentSize: '2048' } },
+  }));
+  const got = readClassFolder(body, '5');
+  assert.deepEqual(got.map((i) => [i.kind, i.name, i.parentNid]), [['folder', 'Quadratic Functions', '5'], ['file', 'Unit 1 notes.pdf', '5']]);
+  assert.deepEqual(got[1].file, { name: 'Unit 1 notes.pdf', type: 'application/pdf', bytes: 2048 });
+  assert.equal(got[0].addedAt, '2026-08-31T14:45:42Z');
+});
+
+test('a file three folders deep still belongs to its class', () => {
+  const classes = JSON.stringify({ slices: [{ data: { classesContainer: { classes: { r: { nid: 5, class: { class: { core: { summary: { line1: { course: 'Functions' }, info: { code: 'MCR3U-05' } } } } } } } } } }] });
+  const n = normalizeCapture([
+    { status: 200, url: '/core/node.json/1?xds=BaseStudentClasses', body: classes },
+    { status: 200, url: '/core/node.json/5?xds=ClassFolder', body: folderBody({ a: { nid: 11, rfrom: 5, nodesubtype: 16, name: 'Unit 1' } }) },
+    { status: 200, url: '/core/node.json/11?xds=ClassFolder', body: folderBody({ b: { nid: 21, rfrom: 11, nodesubtype: 16, name: 'Lessons' } }, 'Unit 1') },
+    { status: 200, url: '/core/node.json/21?xds=ClassFolder', body: folderBody({ c: { nid: 31, rfrom: 21, Content: { ContentName: 'lesson 3.pdf' } } }, 'Lessons') },
+  ], { now: 0 });
+  const file = n.library.find((i) => i.kind === 'file');
+  assert.equal(file.name, 'lesson 3.pdf');
+  assert.equal(file.classNid, '5');
+  assert.ok(n.library.every((i) => i.classNid === '5'));
+});
+
+test("My Work gives units, curriculum and strands, and passes grades through untouched", () => {
+  const body = { slices: [{ data: { nid: 5, courseTitle: 'MCR3U-05', loaddata: {
+    grades: { g1: { anything: 'as Edsby sends it' } },
+    gradebook: {
+      CourseID: 'MCR3U',
+      strands: [{ key: 'k', name: 'Knowledge' }, { key: 'i', name: 'Thinking' }],
+      terms: { r1: { nid: 9, name: 'Algebraic Expressions', sdate: '2026-09-08 04:00:00' } },
+      learningstandards: {
+        a: { fullcode: 'MCR3U:A.10', title: 'later\nexpectation', type: 'content' },
+        b: { fullcode: 'MCR3U:A.2', title: 'Solving   Problems', type: 'Destination' },
+      },
+    },
+  } } }] };
+  const w = readMyWork(body, '5');
+  assert.equal(w.courseCode, 'MCR3U');
+  assert.deepEqual(w.units, [{ nid: '9', name: 'Algebraic Expressions', start: '2026-09-08T04:00:00Z' }]);
+  assert.deepEqual(w.curriculum.map((c) => c.code), ['MCR3U:A.2', 'MCR3U:A.10'], 'A.2 before A.10');
+  assert.equal(w.curriculum[0].title, 'Solving Problems');
+  assert.equal(w.curriculum[0].level, 'overall');
+  assert.equal(w.gradedCount, 1);
+  assert.deepEqual(w.grades, { g1: { anything: 'as Edsby sends it' } });
 });
