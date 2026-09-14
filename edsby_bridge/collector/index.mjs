@@ -24,6 +24,7 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 import { SKIP_PATH, captureKey, cleanUrl, desktopUserAgent, isSignedInState, looksLikeJson, redactBody, skippedView } from './redact.mjs';
+import { normalizeCapture, readClasses, stripLayout } from './normalize.mjs';
 
 /** The engine's real version, for the browser identity Edsby is shown. */
 const CHROMIUM_VERSION = await fs
@@ -34,7 +35,7 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.1.1';
+const VERSION = '0.2.0';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
 const HOST = String(options.edsby_host || '')
@@ -85,7 +86,8 @@ async function record(response) {
     const text = await response.text().catch(() => null);
     if (!text || !looksLikeJson(contentType, text)) return;
 
-    const clean = redactBody(text);
+    // The screen layout first — it is most of every response and none of the data.
+    const clean = redactBody(stripLayout(text));
     const key = captureKey(request.method(), response.url());
     captured.delete(key); // re-insert so the newest sits last
     captured.set(key, {
@@ -154,6 +156,8 @@ async function updateSignedIn(reason) {
 // ---------------------------------------------------------------------------
 
 
+let lastFetchLog = [];
+
 async function push(reason) {
   const page = context.pages()[0];
   const responses = signedIn ? [...captured.values()].reverse() : [];
@@ -166,6 +170,8 @@ async function push(reason) {
     signedIn,
     page: page ? { url: page.url().startsWith('http') ? cleanUrl(page.url()) : '', title: await page.title().catch(() => '') } : null,
     responseCount: responses.length,
+    fetchLog: lastFetchLog,
+    normalized: signedIn ? normalizeCapture(responses, { host: HOST }) : null,
     responses,
   };
   const bytes = JSON.stringify(payload).length;
@@ -236,13 +242,64 @@ async function refresh() {
   try {
     await page.goto(home, { waitUntil: 'networkidle', timeout: 90_000 });
     await page.waitForTimeout(5_000);
+    await lookAtEveryClass(page);
   } catch (err) {
-    log(`the regular look did not finish loading: ${err.message}`);
+    log(`the regular look did not finish: ${err.message}`);
   } finally {
     await page.close().catch(() => {});
   }
   clearTimeout(settleTimer);
   await push('schedule');
+}
+
+/**
+ * Each class's own feed and calendar, the same requests Edsby's app makes when
+ * a class is opened. The home page only carries the newest handful of posts
+ * across all classes; a class's feed carries all of its own.
+ *
+ * Made from inside the signed-in page, one at a time and a moment apart, so to
+ * Edsby it is the student opening their classes.
+ */
+async function lookAtEveryClass(page) {
+  const list = [...captured.values()].find((c) => /xds=BaseStudentClasses/.test(c.url));
+  let classes = [];
+  let studentNid = null;
+  try {
+    const body = JSON.parse(list?.body ?? 'null');
+    classes = readClasses(body);
+    studentNid = body?.slices?.[0]?.data?.nid ?? null;
+  } catch {
+    // no class list yet; the next look will have one
+  }
+  if (classes.length === 0) {
+    log('no class list captured yet; looking at classes next time');
+    return;
+  }
+  const urls = classes.flatMap((c) => [
+    `/core/node.json/${c.nid}?xds=CourseFeed`,
+    `/core/node.json/${c.nid}?xds=CalendarPanel_Class`,
+  ]);
+  // Where Edsby keeps a student's assignments, by the name its own menu uses.
+  if (studentNid) urls.push(`/core/node.json/${studentNid}?xds=MyWork`);
+
+  lastFetchLog = await page.evaluate(async (list) => {
+    const out = [];
+    for (const url of list) {
+      try {
+        const res = await fetch(url, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+        const text = await res.text();
+        out.push({ url, status: res.status, type: res.headers.get('content-type') || '', bytes: text.length });
+      } catch (err) {
+        out.push({ url, status: 0, error: String(err) });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    return out;
+  }, urls);
+  // Let the last responses finish being recorded before anything is sent.
+  await page.waitForTimeout(3_000);
+  const ok = lastFetchLog.filter((f) => f.status === 200 && /json/.test(f.type)).length;
+  log(`looked at ${classes.length} classes: ${ok} of ${lastFetchLog.length} views answered`);
 }
 
 setTimeout(() => void refresh(), 60_000);
