@@ -12,8 +12,9 @@ your classes post — feeds, assignments, tests, calendar — to your DayFlow re
    few minutes, longer on a Raspberry Pi.
 3. **Sign in.** Open the **Edsby** panel in the sidebar (or *Open Web UI*). You
    will see a browser on Edsby's sign-in page. Sign in exactly as you normally
-   would, including a school Google or Microsoft account if that is how you log
-   in. Then click into one or two of your classes so it sees what they load.
+   would — your Edsby username and password, or the **Google** button if you
+   use your school Google account. Tick **Keep me logged in** first, so the
+   session lasts. Then click into one or two of your classes.
 4. Done. The session is kept, and the add-on looks again every few hours
    (`interval_minutes`, 180 by default).
 

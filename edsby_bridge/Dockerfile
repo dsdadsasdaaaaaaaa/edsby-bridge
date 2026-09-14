@@ -17,8 +17,8 @@ RUN apt-get update \
 COPY novnc-index.html /opt/novnc/index.html
 
 WORKDIR /app
-COPY collector/package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+COPY collector/package.json collector/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 COPY collector/index.mjs collector/redact.mjs ./
 
 COPY run.sh /run.sh

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SKIP_PATH, cleanUrl, isSignedInUrl, looksLikeJson, redactBody } from './redact.mjs';
+import { SKIP_PATH, cleanUrl, desktopUserAgent, isSignedInState, looksLikeJson, redactBody } from './redact.mjs';
 
 test('sign-in and session endpoints are never recorded', () => {
   for (const p of ['/core/login/LoginPage', '/logon', '/p/Logout', '/api/auth/refresh', '/oauth2/callback', '/saml/acs', '/sso/start', '/account/password', '/v1/session', '/token', '/sign-in', '/signin']) {
@@ -55,11 +55,36 @@ test('JSON is recognised by type or by shape, HTML is not', () => {
   assert.ok(!looksLikeJson('text/html', '<!doctype html>'));
 });
 
-test('signed-in is judged from where the browser is', () => {
+test("Edsby's real login page is NOT signed in (this is what the first version got wrong)", () => {
   const host = 'tchat.edsby.com';
-  assert.ok(isSignedInUrl('https://tchat.edsby.com/p/BasePublic/', host));
-  assert.ok(!isSignedInUrl('https://tchat.edsby.com/core/login/', host));
-  assert.ok(!isSignedInUrl('https://accounts.google.com/o/oauth2/auth?x=1', host));
-  assert.ok(!isSignedInUrl('https://login.microsoftonline.com/common/oauth2', host));
-  assert.ok(!isSignedInUrl('about:blank', host));
+  // Exactly what a fresh browser showed on 14 September.
+  assert.equal(isSignedInState({ url: 'https://tchat.edsby.com/p/BasePublic/', title: 'Edsby: Login', hasPasswordField: true }, host), false);
+  // Any one of the three signs is enough on its own.
+  assert.equal(isSignedInState({ url: 'https://tchat.edsby.com/p/BasePublic/', title: 'Edsby', hasPasswordField: false }, host), false);
+  assert.equal(isSignedInState({ url: 'https://tchat.edsby.com/p/Somewhere/', title: 'Edsby: Login', hasPasswordField: false }, host), false);
+  assert.equal(isSignedInState({ url: 'https://tchat.edsby.com/p/Somewhere/', title: 'Edsby', hasPasswordField: true }, host), false);
+});
+
+test('signing in with Google or Microsoft is not signed in until back on Edsby', () => {
+  const host = 'tchat.edsby.com';
+  assert.equal(isSignedInState({ url: 'https://accounts.google.com/o/oauth2/auth?x=1', title: 'Sign in - Google Accounts' }, host), false);
+  assert.equal(isSignedInState({ url: 'https://login.microsoftonline.com/common/oauth2', title: 'Sign in to your account' }, host), false);
+  assert.equal(isSignedInState({ url: 'about:blank' }, host), false);
+});
+
+test('past the login, on Edsby, is signed in', () => {
+  assert.equal(isSignedInState({ url: 'https://tchat.edsby.com/p/MyWork/', title: 'Edsby', hasPasswordField: false }, 'tchat.edsby.com'), true);
+});
+
+test("Edsby's own sign-in challenge values are redacted", () => {
+  const body = JSON.stringify({ slices: [{ data: { _formkey: 'FK1', sauthdata: 'SA1', cauthdata: 'CA1', crypttype: 'CT1', name: 'TanenbaumCHAT' } }] });
+  const out = redactBody(body);
+  for (const secret of ['FK1', 'SA1', 'CA1', 'CT1']) assert.ok(!out.includes(secret), `${secret} leaked: ${out}`);
+  assert.ok(out.includes('TanenbaumCHAT'));
+});
+
+test('Edsby is shown an ordinary desktop Chrome of the real engine version', () => {
+  const ua = desktopUserAgent('153.0.8010.12');
+  assert.match(ua, /Chrome\/153\.0\.0\.0 Safari/);
+  assert.doesNotMatch(ua, /Headless|Testing/);
 });

@@ -23,7 +23,13 @@
  */
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
-import { SKIP_PATH, cleanUrl, isSignedInUrl, looksLikeJson, redactBody } from './redact.mjs';
+import { SKIP_PATH, cleanUrl, desktopUserAgent, isSignedInState, looksLikeJson, redactBody } from './redact.mjs';
+
+/** The engine's real version, for the browser identity Edsby is shown. */
+const CHROMIUM_VERSION = await fs
+  .readFile(new URL('./node_modules/playwright-core/browsers.json', import.meta.url), 'utf8')
+  .then((text) => JSON.parse(text).browsers.find((b) => b.name === 'chromium')?.browserVersion)
+  .catch(() => undefined);
 
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
@@ -63,6 +69,10 @@ const captured = new Map();
 let settleTimer = null;
 
 async function record(response) {
+  // Nothing before sign-in. The login page loads Edsby data too, and some of
+  // it is the sign-in challenge; there is nothing of the student's to keep
+  // until they are in.
+  if (!signedIn) return;
   try {
     const url = new URL(response.url());
     if (url.hostname !== HOST) return;
@@ -108,7 +118,35 @@ function trim() {
 // Signed in or not
 // ---------------------------------------------------------------------------
 
-const signedInOn = (page) => isSignedInUrl(page.url(), HOST);
+let signedIn = false;
+
+async function readSignedIn(page) {
+  try {
+    const title = await page.title();
+    const hasPasswordField = await page.evaluate(() =>
+      [...document.querySelectorAll('input[type=password]')].some((el) => el.offsetParent !== null)
+    );
+    return isSignedInState({ url: page.url(), title, hasPasswordField }, HOST);
+  } catch {
+    return false; // mid-navigation: say not yet, and look again shortly
+  }
+}
+
+/** Re-read the state; on arriving signed in, go and fetch everything fresh. */
+async function updateSignedIn(reason) {
+  const main = context.pages()[0];
+  const now = main ? await readSignedIn(main) : false;
+  if (now === signedIn) return now;
+  signedIn = now;
+  if (now) {
+    log(`signed in (${reason}); taking a first look in 10 seconds`);
+    setTimeout(() => void refresh(), 10_000);
+  } else {
+    captured.clear();
+    log(`not signed in (${reason}) — open the Edsby panel in Home Assistant and sign in`);
+  }
+  return now;
+}
 
 // ---------------------------------------------------------------------------
 // Sending
@@ -117,8 +155,7 @@ const signedInOn = (page) => isSignedInUrl(page.url(), HOST);
 
 async function push(reason) {
   const page = context.pages()[0];
-  const signedIn = page ? signedInOn(page) : false;
-  const responses = [...captured.values()].reverse();
+  const responses = signedIn ? [...captured.values()].reverse() : [];
   const payload = {
     version: 1,
     addon: VERSION,
@@ -161,6 +198,7 @@ const context = await chromium.launchPersistentContext(PROFILE_DIR, {
   // the separate headless build, which the add-on image does not need.
   ...(HEADLESS ? { channel: 'chromium' } : {}),
   viewport: null,
+  userAgent: desktopUserAgent(CHROMIUM_VERSION),
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--window-position=0,0', '--window-size=1366,900'],
 });
 context.on('response', record);
@@ -171,8 +209,16 @@ context.on('close', () => {
 
 const home = `https://${HOST}/`;
 const first = context.pages()[0] ?? (await context.newPage());
-await first.goto(home, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch((e) => log(`could not open Edsby: ${e.message}`));
-log(`Edsby open at ${home}; signed in: ${signedInOn(first) ? 'yes' : 'no — open the Edsby panel in Home Assistant and sign in'}`);
+await first.goto(home, { waitUntil: 'networkidle', timeout: 60_000 }).catch((e) => log(`could not open Edsby: ${e.message}`));
+log(`Edsby open at ${home}`);
+signedIn = await readSignedIn(first);
+log(signedIn ? 'signed in: yes (kept from last time)' : 'signed in: no — open the Edsby panel in Home Assistant and sign in');
+// Edsby is a single-page app: signing in does not always load a new page, so
+// the state is re-read on a short timer as well as on navigation.
+first.on('framenavigated', (frame) => {
+  if (frame === first.mainFrame()) setTimeout(() => void updateSignedIn('page changed'), 2_000);
+});
+setInterval(() => void updateSignedIn('check'), 30_000);
 
 /**
  * The regular look. A second tab, so a person using the window is never
@@ -180,8 +226,7 @@ log(`Edsby open at ${home}; signed in: ${signedInOn(first) ? 'yes' : 'no — ope
  * fetches the feed and classes, and closes again.
  */
 async function refresh() {
-  const main = context.pages()[0];
-  if (!main || !signedInOn(main)) {
+  if (!(await updateSignedIn('scheduled look'))) {
     log('not signed in; skipping the regular look');
     await push('status');
     return;
