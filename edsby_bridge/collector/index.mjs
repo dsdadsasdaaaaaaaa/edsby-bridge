@@ -35,7 +35,7 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
 const HOST = String(options.edsby_host || '')

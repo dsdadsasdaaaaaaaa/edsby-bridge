@@ -1,5 +1,5 @@
 name: Edsby Bridge
-version: "0.2.0"
+version: "0.2.1"
 slug: edsby_bridge
 description: Keeps a signed-in Edsby session and sends what your classes post to DayFlow.
 arch:

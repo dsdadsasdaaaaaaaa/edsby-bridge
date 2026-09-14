@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { edsbyInstant, htmlToText, normalizeCapture, readAssessmentDates, readLessonSections, readPost, stripLayout } from './normalize.mjs';
+import { edsbyInstant, htmlToText, normalizeCapture, readAssessmentDates, readLessonSections, readPost, stripLayout, supersedeSchedules } from './normalize.mjs';
 
 // Shapes copied from real Edsby responses; the words are made up.
 const post = (text, postedAt = '2026-09-14T12:57:28Z', extra = {}) => ({ nid: 'p1', classNid: 'c1', className: 'Computer Science', postedAt, text, ...extra });
@@ -16,7 +16,7 @@ test('a test schedule post yields every date, exactly', () => {
   assert.ok(got.every((a) => a.precision === 'day' && !a.weekdayMismatch), 'every stated weekday matches its date');
   assert.ok(got.every((a) => a.tentative), '"not all test dates will be used" makes them tentative');
   assert.equal(got[0].label, 'Test');
-  assert.equal(got.at(-1).label, 'Culminating assessment');
+  assert.equal(got.at(-1).label, 'Culminating Assessment', "the teacher's own words for it");
   assert.equal(got[5].note, '3:08 closing');
 });
 
@@ -141,4 +141,64 @@ test('a whole capture becomes classes, posts and assessments, with posts from tw
   assert.equal(n.posts[0].className, 'Computer Science', 'a feed post takes its class name from the class list');
   assert.equal(n.assessments[0].date, '2026-09-29');
   assert.equal(n.assessments[0].className, 'Computer Science');
+});
+
+// ---- found on the second real capture, 14 September: every class, 45 posts ----
+
+test("a line names its own thing: an ISA is not a test just because the heading says tests", () => {
+  const got = readAssessmentDates(post([
+    'Projected test dates:', 'dates subject to change',
+    'ISA - September 29th', 'Test #1 - October 28th', 'Test #2 - December 9',
+  ].join('\n')));
+  assert.deepEqual(got.map((a) => a.label), ['ISA', 'Test #1', 'Test #2']);
+  assert.deepEqual(got.map((a) => a.date), ['2026-09-29', '2026-10-28', '2026-12-09']);
+  assert.ok(got.every((a) => a.tentative));
+});
+
+test('what a test covers is kept, and one promised date is not tentative', () => {
+  const got = readAssessmentDates(post([
+    'Hi all,', 'tentative test dates:', '3 Tests',
+    'October 21 – the first unit, causes and effects', 'Jan 11 – the second unit',
+    'Minor exam: May 19th', '*Note: all are subject to change except minor exam',
+  ].join('\n'), '2026-09-04T12:00:00Z'));
+  assert.equal(got.length, 3, 'the heading is found on the second line, after a greeting');
+  assert.equal(got[0].topic, 'the first unit, causes and effects');
+  assert.equal(got[1].topic, 'the second unit');
+  const exam = got.find((a) => a.label === 'Minor exam');
+  assert.equal(exam.date, '2027-05-19');
+  assert.equal(exam.tentative, false, '"except minor exam"');
+  assert.ok(got.filter((a) => a !== exam).every((a) => a.tentative));
+});
+
+test('a comma list of dates has no labels or topics borrowed from its neighbours', () => {
+  const got = readAssessmentDates(post('Tentative Assessment Dates which can include tests:\nOct 15, Nov 3, Nov 24'));
+  assert.deepEqual(got.map((a) => [a.date, a.label, a.topic]), [
+    ['2026-10-15', 'Assessment', ''], ['2026-11-03', 'Assessment', ''], ['2026-11-24', 'Assessment', ''],
+  ]);
+});
+
+test('a reposted schedule replaces the earlier one in the same class', () => {
+  const heading = 'Tentative Assessment Dates which can include tests, unit tests and or assignments:';
+  const older = { nid: 'old', classNid: 'f', className: 'Functions', postedAt: '2026-09-01T12:00:00Z', text: `${heading}\nOct 15, Nov 3, Nov 24` };
+  const newer = { nid: 'new', classNid: 'f', className: 'Functions', postedAt: '2026-09-14T12:00:00Z', text: `${heading}\nweek of Oct 5, week of Nov 2` };
+  const other = { nid: 'x', classNid: 'f', className: 'Functions', postedAt: '2026-09-02T12:00:00Z', text: 'Lab report due Thursday October 1st' };
+  const all = [older, newer, other].flatMap(readAssessmentDates);
+  const { current, superseded } = supersedeSchedules(all, [older, newer, other]);
+  assert.deepEqual(current.map((a) => a.date).sort(), ['2026-10-01', '2026-10-05', '2026-11-02'], 'the new schedule and the unrelated due date');
+  assert.equal(superseded.length, 3);
+  assert.ok(superseded.every((a) => a.supersededBy === 'new'));
+});
+
+test('two different schedules in one class are both kept', () => {
+  const a = { nid: 'a', classNid: 'c', className: 'Science', postedAt: '2026-09-01T00:00:00Z', text: 'Test Schedule:\nOctober 1st' };
+  const b = { nid: 'b', classNid: 'c', className: 'Science', postedAt: '2026-09-05T00:00:00Z', text: 'Lab report due dates:\nOctober 8th' };
+  const { current, superseded } = supersedeSchedules([a, b].flatMap(readAssessmentDates), [a, b]);
+  assert.equal(current.length, 2);
+  assert.equal(superseded.length, 0);
+});
+
+test('the same schedule heading in two different classes is two schedules', () => {
+  const a = { nid: 'a', classNid: 'c1', className: 'A', postedAt: '2026-09-01T00:00:00Z', text: 'Test Schedule:\nOctober 1st' };
+  const b = { nid: 'b', classNid: 'c2', className: 'B', postedAt: '2026-09-05T00:00:00Z', text: 'Test Schedule:\nOctober 8th' };
+  assert.equal(supersedeSchedules([a, b].flatMap(readAssessmentDates), [a, b]).current.length, 2);
 });

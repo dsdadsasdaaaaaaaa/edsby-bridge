@@ -273,22 +273,78 @@ function weekdayOf(iso) {
 
 const SINGULAR = { quizzes: 'quiz', 'unit tests': 'unit test', 'projects due': 'project due', due: 'due' };
 
-function labelFor(line, heading) {
+function capitalise(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function headingLabel(line, heading) {
   if (/culminating/i.test(line)) return 'Culminating assessment';
   const own = ASSESSMENT_WORD.exec(line);
   const word = ((own ?? ASSESSMENT_WORD.exec(heading))?.[1] ?? 'assessment').toLowerCase();
-  const base = SINGULAR[word] ?? word.replace(/s$/, '');
-  return base.charAt(0).toUpperCase() + base.slice(1);
+  return capitalise(SINGULAR[word] ?? word.replace(/s$/, ''));
+}
+
+/**
+ * The line's own name for what happens on the date, when it gives one.
+ *
+ * "ISA - September 29th", "Test #1 - October 28th", "Minor exam: May 19th":
+ * the words before the date are the teacher naming the thing. Taking the
+ * heading's word instead called an independent study assignment a test.
+ */
+function lineLabel(line, matchIndex) {
+  const before = line
+    .slice(0, matchIndex)
+    .replace(/[\s:–—-]+$/u, '')
+    .replace(/\s+(on|is|due|by|for|will be)$/i, '')
+    .trim();
+  if (!before || before.length > 40) return null;
+  if (before.split(/\s+/).length > 5) return null;
+  // Another date in front means this is a list, and the list has no label.
+  if (new RegExp(DATE_PATTERN.source, 'i').test(before)) return null;
+  if (/[,;]$/.test(before)) return null;
+  return capitalise(before);
+}
+
+/** What the date is about, when the line says: "October 21 – reactions to emancipation". */
+function lineTopic(line, matchEnd) {
+  const after = line
+    .slice(matchEnd)
+    .replace(/\([^)]*\)/g, '')
+    .replace(/^[\s,;:–—-]+/u, '')
+    .replace(/[.\s]+$/, '')
+    .trim();
+  if (after.length < 2 || after.length > 120) return '';
+  if (new RegExp(DATE_PATTERN.source, 'i').test(after)) return '';
+  return after;
+}
+
+/** The line naming a post as a schedule, when one of its first three does. */
+function scheduleHeading(lines) {
+  if (/^class date/i.test(lines[0] ?? '')) return '';
+  return (
+    lines
+      .slice(0, 3)
+      .find((l) => l.length <= 110 && ASSESSMENT_WORD.test(l) && /(dates?|schedule|calendar|:\s*$)/i.test(l)) ?? ''
+  );
+}
+
+/**
+ * "all are subject to change except minor exam": the one thing the teacher
+ * has promised. Returns that phrase, lower-cased, or ''.
+ */
+function exceptedFromTentative(text) {
+  const m = /(?:subject to change|tentative|may change)[^.\n]{0,20}?\bexcept(?:\s+for)?(?:\s+the)?\s+([a-z][a-z #0-9]{1,30}?)\s*(?:[.,;)\n]|$)/i.exec(text);
+  return m ? m[1].trim().toLowerCase() : '';
 }
 
 /**
  * Every assessment date a post announces.
  *
- * A post is read as a schedule when its opening lines are about assessments
- * ("Test Schedule: Block 2", "Tentative Assessment Dates…"); then every date
- * in it counts. Otherwise only a line that itself names a test, quiz, exam or
- * due date counts — so "Class Date: Monday September 14th" in a lesson post
- * is never mistaken for a test.
+ * A post is read as a schedule when one of its first three lines names one
+ * ("Test Schedule: Block 2", "Projected test dates:", "Hi all, / tentative
+ * test dates:"); then every date in it counts. Otherwise only a line that
+ * itself names a test, quiz, exam or due date counts — so "Class Date: Monday
+ * September 14th" in a lesson post is never mistaken for a test.
  *
  * A stated weekday is checked against the date. A mismatch is kept and
  * flagged, never silently corrected: it usually means the teacher typed one
@@ -297,13 +353,15 @@ function labelFor(line, heading) {
 export function readAssessmentDates(post) {
   const lines = String(post?.text ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
   if (lines.length === 0) return [];
-  const opening = lines.slice(0, 2).join(' ');
-  const schedulePost = ASSESSMENT_WORD.test(opening) && !/^class date/i.test(lines[0]);
+  const heading = scheduleHeading(lines);
+  const schedulePost = Boolean(heading);
   const tentativePost = TENTATIVE.test(post.text);
+  const excepted = exceptedFromTentative(post.text);
   const out = [];
 
   for (const line of lines) {
     if (NOT_ASSESSMENT_LINE.test(line)) continue;
+    if (line === heading && !new RegExp(DATE_PATTERN.source, 'i').test(line)) continue;
     if (!schedulePost && !ASSESSMENT_WORD.test(line)) continue;
     for (const m of line.matchAll(DATE_PATTERN)) {
       const g = m.groups;
@@ -318,19 +376,24 @@ export function readAssessmentDates(post) {
         if (said != null && said !== weekdayOf(date)) weekdayMismatch = true;
       }
       const precision = g.week ? 'week' : alternatives.length ? 'either' : 'day';
-      const note = /\(([^)]{1,40})\)/.exec(line.slice(m.index + m[0].length, m.index + m[0].length + 45))?.[1] ?? '';
+      const end = m.index + m[0].length;
+      const note = /\(([^)]{1,40})\)/.exec(line.slice(end, end + 45))?.[1] ?? '';
+      const label = lineLabel(line, m.index) ?? headingLabel(line, heading || lines[0]);
+      const promised = Boolean(excepted) && (line.toLowerCase().includes(excepted) || label.toLowerCase().includes(excepted));
       out.push({
         source: 'post',
         postNid: post.nid,
         classNid: post.classNid,
         className: post.className,
-        label: labelFor(line, opening),
+        label,
+        topic: lineTopic(line, end),
         date,
         alternatives,
         precision,
-        tentative: tentativePost || TENTATIVE.test(line),
+        tentative: (tentativePost || TENTATIVE.test(line)) && !promised,
         weekdayMismatch,
         note,
+        heading,
         evidence: line.slice(0, 200),
       });
     }
@@ -343,6 +406,59 @@ export function readAssessmentDates(post) {
     seen.add(key);
     return true;
   });
+}
+
+function headingWords(text) {
+  return new Set(String(text).toLowerCase().match(/[a-z]{3,}/g) ?? []);
+}
+
+function sameSchedule(a, b) {
+  if (!a || !b) return false;
+  const wa = headingWords(a);
+  const wb = headingWords(b);
+  if (wa.size === 0 || wb.size === 0) return false;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared++;
+  return shared / new Set([...wa, ...wb]).size >= 0.7;
+}
+
+/**
+ * When a teacher reposts a schedule, the new one replaces the old.
+ *
+ * Mr. Abikzir posted "Tentative Assessment Dates…" on 1 September with eight
+ * dates, then again on the 14th with a revised list of weeks. Kept together,
+ * the class showed fifteen dates that contradicted each other. Posts in the
+ * same class whose schedule headings match are one schedule; the newest wins
+ * and the older dates are returned separately, marked with what replaced
+ * them, rather than silently dropped.
+ */
+export function supersedeSchedules(assessments, posts) {
+  const postedAt = new Map(posts.map((p) => [p.nid, p.postedAt ?? '']));
+  const byClass = new Map();
+  for (const a of assessments) {
+    if (a.source !== 'post' || !a.heading) continue;
+    const list = byClass.get(a.classNid) ?? new Map();
+    list.set(a.postNid, a.heading);
+    byClass.set(a.classNid, list);
+  }
+  const replacedBy = new Map();
+  for (const schedules of byClass.values()) {
+    const entries = [...schedules.entries()].sort((x, y) => String(postedAt.get(y[0])).localeCompare(String(postedAt.get(x[0]))));
+    entries.forEach(([nid, heading], i) => {
+      if (replacedBy.has(nid)) return;
+      for (const [olderNid, olderHeading] of entries.slice(i + 1)) {
+        if (!replacedBy.has(olderNid) && sameSchedule(heading, olderHeading)) replacedBy.set(olderNid, nid);
+      }
+    });
+  }
+  const current = [];
+  const superseded = [];
+  for (const a of assessments) {
+    const by = a.source === 'post' ? replacedBy.get(a.postNid) : undefined;
+    if (by) superseded.push({ ...a, supersededBy: by });
+    else current.push(a);
+  }
+  return { current, superseded };
 }
 
 // ---------------------------------------------------------------------------
@@ -406,9 +522,8 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
   const postList = [...posts.values()]
     .map((p) => ({ ...p, className: p.className || classes.get(p.classNid)?.name || '' }))
     .sort((a, b) => String(b.postedAt).localeCompare(String(a.postedAt)));
-  const assessments = [...edsbyAssessments, ...postList.flatMap(readAssessmentDates)].sort((a, b) =>
-    String(a.date).localeCompare(String(b.date))
-  );
+  const byDate = (a, b) => String(a.date).localeCompare(String(b.date));
+  const { current, superseded } = supersedeSchedules([...edsbyAssessments, ...postList.flatMap(readAssessmentDates)], postList);
 
   return {
     schema: 1,
@@ -418,7 +533,8 @@ export function normalizeCapture(responses, { host = '', now = Date.now() } = {}
     timetable: timetable.sort((a, b) => String(a.start).localeCompare(String(b.start))),
     events: [...events.values()].sort((a, b) => String(a.start).localeCompare(String(b.start))),
     posts: postList,
-    assessments,
+    assessments: current.sort(byDate),
+    supersededAssessments: superseded.sort(byDate),
   };
 }
 
