@@ -128,7 +128,7 @@ export function readCalendar(body) {
         source: 'edsby',
         classNid: String(it.pnid ?? it.nid ?? ''),
         label: String(it.name ?? it.Title ?? 'Assessment').trim(),
-        date: edsbyDate(String(it.sdate ?? '').slice(0, 10)),
+        date: edsbyDate(String(it.sdate ?? '')) ?? String(it.sdate ?? '').slice(0, 10),
         precision: 'day',
         tentative: false,
         evidence: '',
@@ -408,6 +408,38 @@ export function readAssessmentDates(post) {
   });
 }
 
+
+/**
+ * One assessment, not two, when a teacher both dates it in the gradebook and
+ * announces it in a post.
+ *
+ * Physics has "ISA demo + notes due" on 29 September in the gradebook and
+ * "ISA - September 29th" in a post. The gradebook entry is kept — it has the
+ * due time, weight and category — and takes the post's topic and the line it
+ * was announced in, so nothing either source said is lost. Only exact-day
+ * matches in the same class merge; a "week of" or "either" date stays apart.
+ */
+export function mergeAnnouncements(assessments) {
+  const fromEdsby = assessments.filter((a) => a.source === 'edsby');
+  const out = [];
+  for (const a of assessments) {
+    if (a.source !== 'post' || a.precision !== 'day') {
+      out.push(a);
+      continue;
+    }
+    const twin = fromEdsby.find((e) => e.classNid === a.classNid && e.date === a.date);
+    if (!twin) {
+      out.push(a);
+      continue;
+    }
+    twin.announcedIn = a.postNid;
+    twin.evidence = twin.evidence || a.evidence;
+    twin.topic = twin.topic || a.topic || '';
+    twin.tentative = twin.tentative || a.tentative;
+  }
+  return out;
+}
+
 function headingWords(text) {
   return new Set(String(text).toLowerCase().match(/[a-z]{3,}/g) ?? []);
 }
@@ -508,33 +540,88 @@ export function readClassFolder(body, containerNid) {
     .filter((it) => it.nid);
 }
 
+
+/**
+ * The local calendar date an Edsby instant falls on.
+ *
+ * Edsby stores due dates as UTC moments; a due date of 20:00 UTC is 4 PM in
+ * Toronto the same day, but a test at 01:00 UTC belongs to the evening
+ * before. Taking the UTC date put some of those on the wrong day.
+ */
+export function localDateOf(instant, timeZone) {
+  if (!instant) return null;
+  const d = new Date(instant);
+  if (Number.isNaN(d.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
+  const get = (t) => parts.find((p) => p.type === t)?.value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+/** Ongoing marks with a nominal date: not something to put on a calendar. */
+const ONGOING = /^(participation|attendance|engagement|class conduct)\b/i;
+
 function oneLine(text) {
   return String(text ?? '').replace(/\s+/g, ' ').trim();
 }
 
 /**
- * A class's My Work: its units, the curriculum expectations it covers, how it
- * is marked, and whatever has been graded.
+ * A class's My Work: its units, its work, how it is marked, and whatever has
+ * been graded. Edsby also sends the curriculum expectations each class maps
+ * to; they are left out, because the classes do not follow them closely.
  *
  * Grades are passed through as Edsby sends them, not interpreted: none had
  * been entered when this was written, so their shape has never been seen, and
  * guessing at a mark would be worse than handing it over untouched.
  */
-export function readMyWork(body, classNid) {
+export function readMyWork(body, classNid, { timeZone = 'UTC' } = {}) {
   const data = sliceData(body);
   const load = data?.loaddata ?? {};
   const gb = load.gradebook ?? {};
   const grades = load.grades && typeof load.grades === 'object' ? load.grades : {};
+  const terms = Object.values(gb.terms ?? {});
+  // Edsby's "terms" hold two different things: categories and units
+  // (subtype 4: "Unit 1: Short Stories", "ISA", "Exam") and the pieces of
+  // work inside them (subtype 3: "Literary Paragraph", "Test 1"). The first
+  // version read all of them as units.
+  const categories = new Map(terms.filter((t) => String(t.nodesubtype) === '4').map((t) => [String(t.nid), oneLine(t.name)]));
+  const work = terms
+    .filter((t) => String(t.nodesubtype) === '3')
+    .map((t) => {
+      const created = edsbyInstant(t.cdate);
+      const dueAt = edsbyInstant(t.duedate) ?? edsbyInstant(t.date);
+      const assignedAt = edsbyInstant(t.sdate);
+      // An item the teacher never dated carries its own creation moment as
+      // its date, to within a minute; a real date sits days or weeks later.
+      const dateSet = Boolean(dueAt && created) && Math.abs(new Date(dueAt) - new Date(created)) >= 24 * 3_600_000;
+      const name = oneLine(t.name);
+      const categoryNid = String(t.fraction ?? '').split('/')[0];
+      const outOf = Number(Object.values(t.columns ?? {})[0]);
+      const weight = Number(Object.values(t.weighting ?? {})[0]);
+      return {
+        nid: String(t.nid ?? ''),
+        name,
+        category: categories.get(categoryNid) ?? '',
+        type: /^\d+$/.test(String(t.type ?? '')) ? '' : oneLine(t.type),
+        assignedDate: localDateOf(assignedAt, timeZone),
+        dueDate: dateSet ? localDateOf(dueAt, timeZone) : null,
+        dueAt: dateSet ? dueAt : null,
+        dateSet,
+        placeholder: /place\s?holder/i.test(name),
+        ongoing: ONGOING.test(name),
+        summative: String(t.summative) === '1',
+        outOf: Number.isFinite(outOf) ? outOf : null,
+        weight: Number.isFinite(weight) ? weight : null,
+        submitsOnline: String(t.esubmit) === '1',
+      };
+    })
+    .sort((a, b) => String(a.dueDate ?? '9999').localeCompare(String(b.dueDate ?? '9999')));
+
   return {
     classNid: String(classNid ?? data?.nid ?? ''),
     courseCode: gb.CourseID ?? data?.courseTitle ?? '',
-    units: Object.values(gb.terms ?? {})
-      .map((t) => ({ nid: String(t.nid ?? ''), name: oneLine(t.name), start: edsbyInstant(t.sdate) }))
-      .sort((a, b) => String(a.start).localeCompare(String(b.start))),
+    units: [...categories.entries()].map(([nid, name]) => ({ nid, name })),
+    work,
     strands: (gb.strands ?? []).map((st) => ({ key: st.key ?? '', name: st.name ?? '' })),
-    curriculum: Object.values(gb.learningstandards ?? {})
-      .map((ls) => ({ code: ls.fullcode ?? ls.name ?? '', title: oneLine(ls.title), level: ls.type === 'Destination' ? 'overall' : 'specific' }))
-      .sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true })),
     gradedCount: Object.keys(grades).length,
     grades,
   };
@@ -552,7 +639,7 @@ function nidOf(url) {
   return /\/node\.json\/(\d+)/.exec(url)?.[1] ?? null;
 }
 
-export function normalizeCapture(responses, { host = '', now = Date.now(), storedFiles = new Set() } = {}) {
+export function normalizeCapture(responses, { host = '', now = Date.now(), storedFiles = new Set(), timeZone = 'UTC' } = {}) {
   const classes = new Map();
   const timetable = [];
   const events = new Map();
@@ -589,7 +676,7 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
     } else if (view === 'ClassFolder' || view === 'Folder') {
       for (const it of readClassFolder(body, nidOf(r.url))) libraryItems.set(it.nid, it);
     } else if (view === 'MyWork') {
-      const work = readMyWork(body, nidOf(r.url));
+      const work = readMyWork(body, nidOf(r.url), { timeZone });
       if (work.classNid) mywork.set(work.classNid, work);
     } else if (view === 'CourseFeed') {
       const feedNid = nidOf(r.url);
@@ -613,7 +700,41 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
     }))
     .sort((a, b) => String(b.postedAt).localeCompare(String(a.postedAt)));
   const byDate = (a, b) => String(a.date).localeCompare(String(b.date));
-  const { current, superseded } = supersedeSchedules([...edsbyAssessments, ...postList.flatMap(readAssessmentDates)], postList);
+  // Work a teacher dated in the gradebook is the firmest date there is: its
+  // own due time, weight and category. Undated items, placeholders and
+  // ongoing marks (participation, attendance) stay in mywork[].work only.
+  for (const w of mywork.values()) {
+    for (const item of w.work) {
+      if (!item.dateSet || item.placeholder || item.ongoing) continue;
+      edsbyAssessments.push({
+        source: 'edsby',
+        workNid: item.nid,
+        classNid: w.classNid,
+        className: classes.get(w.classNid)?.name ?? '',
+        label: item.name,
+        category: item.category,
+        topic: '',
+        date: item.dueDate,
+        dueAt: item.dueAt,
+        assignedDate: item.assignedDate,
+        alternatives: [],
+        precision: 'day',
+        tentative: false,
+        weekdayMismatch: false,
+        summative: item.summative,
+        weight: item.weight,
+        outOf: item.outOf,
+        note: '',
+        heading: '',
+        evidence: '',
+      });
+    }
+  }
+  const { current: afterSupersede, superseded } = supersedeSchedules(
+    [...edsbyAssessments, ...postList.flatMap(readAssessmentDates)],
+    postList
+  );
+  const current = mergeAnnouncements(afterSupersede);
 
   // Each library entry learns its class by walking up through its parents.
   const classOf = (nid, depth = 0) => {
@@ -644,6 +765,12 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
 export function stripLayout(text) {
   const body = parseBody(text);
   if (!body || !Array.isArray(body.slices)) return text;
-  for (const slice of body.slices) if (slice && typeof slice === 'object') delete slice.xds;
+  for (const slice of body.slices) {
+    if (!slice || typeof slice !== 'object') continue;
+    delete slice.xds;
+    // Curriculum expectations: not used, so not sent.
+    const gradebook = slice.data?.loaddata?.gradebook;
+    if (gradebook && typeof gradebook === 'object') delete gradebook.learningstandards;
+  }
   return JSON.stringify(body);
 }

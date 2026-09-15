@@ -35,7 +35,8 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
+const TIME_ZONE = process.env.TZ || 'America/Toronto';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
 const HOST = String(options.edsby_host || '')
@@ -232,7 +233,12 @@ let lastFetchLog = [];
 
 async function push(reason) {
   const page = context.pages()[0];
-  const responses = signedIn ? [...captured.values()].reverse() : [];
+  const all = signedIn ? [...captured.values()].reverse() : [];
+  const normalized = signedIn ? normalizeCapture(all, { host: HOST, timeZone: TIME_ZONE, storedFiles: new Set(storedFiles.keys()) }) : null;
+  // Until a look has found the classes there is nothing worth keeping, so
+  // only the status goes; the relay holds on to the last full capture.
+  const complete = Boolean(normalized?.classes?.length);
+  const responses = complete ? all : [];
   const payload = {
     version: 1,
     addon: VERSION,
@@ -243,10 +249,11 @@ async function push(reason) {
     page: page ? { url: page.url().startsWith('http') ? cleanUrl(page.url()) : '', title: await page.title().catch(() => '') } : null,
     responseCount: responses.length,
     fetchLog: lastFetchLog,
-    addressLog: signedIn ? addressLog : [],
+    addressLog: complete ? addressLog : [],
     downloadLog: lastDownloadLog,
     storedFileCount: storedFiles.size,
-    normalized: signedIn ? normalizeCapture(responses, { host: HOST, storedFiles: new Set(storedFiles.keys()) }) : null,
+    complete,
+    normalized: complete ? normalized : null,
     responses,
   };
   const bytes = JSON.stringify(payload).length;
@@ -264,7 +271,9 @@ async function push(reason) {
       log(`relay refused the capture: ${res.status} ${await res.text().catch(() => '')}`);
       return;
     }
-    log(`sent ${responses.length} responses (${Math.round(bytes / 1024)} KB), signed in: ${signedIn ? 'yes' : 'no'}, because: ${reason}`);
+    log(complete
+      ? `sent ${responses.length} responses (${Math.round(bytes / 1024)} KB) because: ${reason}`
+      : `sent status only (signed in: ${signedIn ? 'yes' : 'no'}, no classes captured yet) because: ${reason}`);
   } catch (err) {
     log(`could not reach the relay: ${err?.message ?? err}`);
   }
@@ -440,8 +449,8 @@ const storedFiles = new Map(
 let lastDownloadLog = [];
 
 const MAX_FILE_BYTES = 20_000_000;
-const MAX_FILES_PER_LOOK = 25;
-const MAX_BYTES_PER_LOOK = 60_000_000;
+const MAX_FILES_PER_LOOK = 60;
+const MAX_BYTES_PER_LOOK = 150_000_000;
 
 /**
  * Each new library file and post attachment, fetched once and stored on the
@@ -455,7 +464,7 @@ const MAX_BYTES_PER_LOOK = 60_000_000;
  */
 async function storeNewFiles() {
   if (!SECRET || !RELAY || !signedIn) return;
-  const n = normalizeCapture([...captured.values()], { host: HOST });
+  const n = normalizeCapture([...captured.values()], { host: HOST, timeZone: TIME_ZONE });
   const wanted = new Map();
   for (const it of n.library) if (it.kind === 'file' && it.file) wanted.set(it.nid, it.file);
   for (const p of n.posts) for (const f of p.files) if (f.nid) wanted.set(f.nid, f);

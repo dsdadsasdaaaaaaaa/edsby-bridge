@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { edsbyInstant, htmlToText, normalizeCapture, readAssessmentDates, readClassFolder, readLessonSections, readMyWork, readPost, stripLayout, supersedeSchedules } from './normalize.mjs';
+import { edsbyInstant, htmlToText, localDateOf, mergeAnnouncements, normalizeCapture, readAssessmentDates, readClassFolder, readLessonSections, readMyWork, readPost, stripLayout, supersedeSchedules } from './normalize.mjs';
 
 // Shapes copied from real Edsby responses; the words are made up.
 const post = (text, postedAt = '2026-09-14T12:57:28Z', extra = {}) => ({ nid: 'p1', classNid: 'c1', className: 'Computer Science', postedAt, text, ...extra });
@@ -232,29 +232,32 @@ test('a file three folders deep still belongs to its class', () => {
   assert.ok(n.library.every((i) => i.classNid === '5'));
 });
 
-test("My Work gives units, curriculum and strands, and passes grades through untouched", () => {
-  const body = { slices: [{ data: { nid: 5, courseTitle: 'MCR3U-05', loaddata: {
+test('My Work separates units from work, and passes grades through untouched', () => {
+  const body = { slices: [{ data: { nid: 5, courseTitle: 'ENG3U-11', loaddata: {
     grades: { g1: { anything: 'as Edsby sends it' } },
     gradebook: {
-      CourseID: 'MCR3U',
-      strands: [{ key: 'k', name: 'Knowledge' }, { key: 'i', name: 'Thinking' }],
-      terms: { r1: { nid: 9, name: 'Algebraic Expressions', sdate: '2026-09-08 04:00:00' } },
-      learningstandards: {
-        a: { fullcode: 'MCR3U:A.10', title: 'later\nexpectation', type: 'content' },
-        b: { fullcode: 'MCR3U:A.2', title: 'Solving   Problems', type: 'Destination' },
+      CourseID: 'ENG3U',
+      strands: [{ key: 'k', name: 'Knowledge' }],
+      terms: {
+        u: { nid: 70, name: 'Unit 1: Short Stories', nodesubtype: 4 },
+        w: { nid: 71, name: 'Literary Paragraph', nodesubtype: 3, fraction: '70/1', cdate: '2026-09-03 17:26:07', sdate: '2026-10-05 20:00:00', duedate: '2026-10-16 20:00:00', columns: { 0: 100 }, weighting: { 0: 10 }, summative: '1', type: '2', esubmit: 0 },
       },
+      learningstandards: {},
     },
   } } }] };
-  const w = readMyWork(body, '5');
-  assert.equal(w.courseCode, 'MCR3U');
-  assert.deepEqual(w.units, [{ nid: '9', name: 'Algebraic Expressions', start: '2026-09-08T04:00:00Z' }]);
-  assert.deepEqual(w.curriculum.map((c) => c.code), ['MCR3U:A.2', 'MCR3U:A.10'], 'A.2 before A.10');
-  assert.equal(w.curriculum[0].title, 'Solving Problems');
-  assert.equal(w.curriculum[0].level, 'overall');
+  const w = readMyWork(body, '5', { timeZone: 'America/Toronto' });
+  assert.equal(w.courseCode, 'ENG3U');
+  assert.deepEqual(w.units, [{ nid: '70', name: 'Unit 1: Short Stories' }]);
+  assert.equal(w.work.length, 1);
+  assert.deepEqual(
+    { ...w.work[0] },
+    { nid: '71', name: 'Literary Paragraph', category: 'Unit 1: Short Stories', type: '', assignedDate: '2026-10-05', dueDate: '2026-10-16', dueAt: '2026-10-16T20:00:00Z', dateSet: true, placeholder: false, ongoing: false, summative: true, outOf: 100, weight: 10, submitsOnline: false }
+  );
   assert.equal(w.gradedCount, 1);
   assert.deepEqual(w.grades, { g1: { anything: 'as Edsby sends it' } });
+  assert.equal(w.curriculum, undefined, 'curriculum expectations are not sent');
+  assert.ok(!stripLayout(JSON.stringify(body)).includes('learningstandards'));
 });
-
 test('a folder opened with xds=Folder lists its files, without the link back to the class', () => {
   const body = { slices: [{ data: { title: 'Algebraic Expressions', body: { table: { itemSource: { item: {
     a: { nid: 31, rfrom: 11, date: '2026-09-14 16:43:40', creatorname: 'Mr. A', name: 'Lesson notes.pdf', nodetype: 5, nodesubtype: 0,
@@ -265,4 +268,60 @@ test('a folder opened with xds=Folder lists its files, without the link back to 
   assert.equal(got.length, 1);
   assert.deepEqual([got[0].kind, got[0].name, got[0].parentNid], ['file', 'Lesson notes.pdf', '11']);
   assert.deepEqual(got[0].file, { name: 'Lesson notes.pdf', type: 'application/pdf', bytes: 371211 });
+});
+
+// ---- from the study app's report on the 0.4.0 data, 15 September ----
+
+test('an item the teacher never dated is recognised by its date equalling its creation', () => {
+  const term = (name, cdate, due) => ({ nid: name, name, nodesubtype: 3, cdate, date: due, columns: { 0: 1 }, weighting: { 0: 1 }, summative: '0' });
+  const body = { slices: [{ data: { loaddata: { grades: {}, gradebook: { terms: {
+    a: term('Exam Placeholder', '2026-09-10 19:32:54', '2026-09-10 19:32:20'),
+    b: term('Test 2', '2026-09-10 16:39:50', '2026-09-10 16:39:08'),
+    c: term('Test 1', '2026-09-10 16:37:52', '2026-11-03 18:25:00'),
+    d: term('Participation', '2026-09-10 16:49:56', '2026-09-10 16:48:59'),
+    e: term('Attendance', '2026-09-10 16:53:06', '2027-06-03 17:25:00'),
+  } } } } }] };
+  const work = Object.fromEntries(readMyWork(body, '9', { timeZone: 'America/Toronto' }).work.map((x) => [x.name, x]));
+  assert.equal(work['Exam Placeholder'].dateSet, false);
+  assert.equal(work['Exam Placeholder'].placeholder, true);
+  assert.equal(work['Test 2'].dateSet, false, 'a real name, never dated');
+  assert.equal(work['Test 2'].dueDate, null);
+  assert.equal(work['Test 1'].dateSet, true);
+  assert.equal(work['Test 1'].dueDate, '2026-11-03');
+  assert.equal(work['Attendance'].ongoing, true);
+});
+
+test('dated gradebook work becomes an assessment; undated, placeholder and ongoing items do not', () => {
+  const classes = JSON.stringify({ slices: [{ data: { classesContainer: { classes: { r: { nid: 9, class: { class: { core: { summary: { line1: { course: 'Explore Excellence' }, info: { code: 'HZJ3O-11' } } } } } } } } } }] });
+  const t = (nid, name, cdate, due, extra = {}) => ({ nid, name, nodesubtype: 3, cdate, date: due, summative: '1', columns: { 0: 100 }, weighting: { 0: 100 }, ...extra });
+  const mywork = JSON.stringify({ slices: [{ data: { loaddata: { grades: {}, gradebook: { terms: {
+    a: t(1, 'Test 1', '2026-09-10 16:37:52', '2026-11-03 18:25:00'),
+    b: t(2, 'Test 2', '2026-09-10 16:39:50', '2026-09-10 16:39:08'),
+    c: t(3, 'Exam Placeholder', '2026-09-10 19:32:54', '2026-09-10 19:32:20'),
+    d: t(4, 'Attendance', '2026-09-10 16:53:06', '2027-06-03 17:25:00'),
+  } } } } }] });
+  const n = normalizeCapture([
+    { status: 200, url: '/core/node.json/1?xds=BaseStudentClasses', body: classes },
+    { status: 200, url: '/core/node.json/9?xds=MyWork&MyWork_active=assessments', body: mywork },
+  ], { now: 0, timeZone: 'America/Toronto' });
+  assert.deepEqual(n.assessments.map((a) => [a.source, a.label, a.date, a.className]), [['edsby', 'Test 1', '2026-11-03', 'Explore Excellence']]);
+  assert.equal(n.mywork[0].work.length, 4, 'every item is still visible to the tutor');
+});
+
+test('a gradebook date and the post announcing it are one assessment, keeping both sides', () => {
+  const edsby = { source: 'edsby', classNid: 'p', date: '2026-09-29', label: 'ISA demo + notes due', topic: '', evidence: '', tentative: false, precision: 'day', weight: 100 };
+  const post = { source: 'post', postNid: '77', classNid: 'p', date: '2026-09-29', label: 'ISA', topic: 'electricity', evidence: 'ISA - September 29th', tentative: true, precision: 'day' };
+  const week = { source: 'post', postNid: '78', classNid: 'p', date: '2026-09-28', label: 'Test', precision: 'week' };
+  const other = { source: 'post', postNid: '79', classNid: 'q', date: '2026-09-29', label: 'Test', precision: 'day' };
+  const got = mergeAnnouncements([edsby, post, week, other]);
+  assert.equal(got.length, 3);
+  const merged = got.find((a) => a.source === 'edsby');
+  assert.deepEqual([merged.label, merged.announcedIn, merged.topic, merged.evidence, merged.tentative, merged.weight], ['ISA demo + notes due', '77', 'electricity', 'ISA - September 29th', true, 100]);
+});
+
+test('Edsby due times become the local day they fall on', () => {
+  assert.equal(localDateOf('2026-10-16T20:00:00Z', 'America/Toronto'), '2026-10-16');
+  assert.equal(localDateOf('2026-10-17T01:30:00Z', 'America/Toronto'), '2026-10-16', '9:30 PM the evening before in Toronto');
+  assert.equal(localDateOf('2027-03-04T14:31:00Z', 'America/Toronto'), '2027-03-04');
+  assert.equal(localDateOf(null, 'America/Toronto'), null);
 });
