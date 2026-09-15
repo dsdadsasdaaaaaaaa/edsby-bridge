@@ -93,6 +93,109 @@ export function readClasses(body) {
     .filter((c) => c.nid);
 }
 
+function clockIn(text) {
+  const m = /\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b/i.exec(text) ?? (/\bnoon\b/i.test(text) ? [null, '12', '00', 'p'] : null);
+  if (!m) return null;
+  let hour = Number(m[1]) % 12;
+  if (m[3].toLowerCase() === 'p') hour += 12;
+  return `${String(hour).padStart(2, '0')}:${m[2] ?? '00'}`;
+}
+
+function localClockOf(instant, timeZone) {
+  if (!instant) return null;
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(instant));
+  return `${parts.find((x) => x.type === 'hour').value}:${parts.find((x) => x.type === 'minute').value}`;
+}
+
+/**
+ * What a school event means for the day. The school announces its changes
+ * as calendar entries with the change in the title — "10:30am Start",
+ * "3:08pm Closing", "Noon dismissal", "Special Schedule blocks 1, 3, 5, 10",
+ * "Yom Kippur School Closed" — and a timed one spans the school day it
+ * describes, so the day's hours come from the entry's own start and end.
+ */
+export function classifySchoolEvent(event, timeZone = 'UTC') {
+  const title = String(event?.title ?? '');
+  const date = event?.allDay ? event.start : localDateOf(event?.start, timeZone);
+  const hours = event?.allDay ? null : { start: localClockOf(event.start, timeZone), end: localClockOf(event.end, timeZone) };
+  if (/\b(school\s+closed|no\s+school|school\s+is\s+closed)\b/i.test(title)) return { kind: 'closure', date };
+  if (/\bspecial\s+schedule\b/i.test(title)) {
+    const blocks = [...(/blocks?\s+([\d,\s&and]+)/i.exec(title)?.[1] ?? '').matchAll(/\d+/g)].map((m) => Number(m[0]));
+    return { kind: 'special-schedule', date, blocks };
+  }
+  if (/\b(start|late\s+start|opening)\b/i.test(title) && clockIn(title)) return { kind: 'late-start', date, schoolStarts: clockIn(title), hours };
+  if (/\b(closing|dismissal|early\s+close)\b/i.test(title)) return { kind: 'early-dismissal', date, schoolEnds: clockIn(title) ?? hours?.end ?? null, hours };
+  if (/\bno\s+assessments?\b/i.test(title)) return { kind: 'no-assessments', date };
+  return { kind: 'event', date, time: clockIn(title) };
+}
+
+function datesBetween(start, end) {
+  const out = [];
+  const last = end && end >= start ? end : start;
+  for (let d = new Date(`${start}T12:00:00Z`); d.toISOString().slice(0, 10) <= last && out.length < 31; d.setUTCDate(d.getUTCDate() + 1)) out.push(d.toISOString().slice(0, 10));
+  return out;
+}
+
+/**
+ * One entry per date the school changed: closed, starting late, ending early,
+ * running only some blocks, or with no assessments allowed. An ordinary event
+ * (a club fair, a university visit) changes nothing and makes no entry.
+ */
+export function readSchoolDays(classifiedEvents) {
+  const days = new Map();
+  const day = (date) => {
+    if (!days.has(date)) days.set(date, { date, closed: false, shortDay: false, lateStart: false, schoolStarts: null, schoolEnds: null, blocks: null, noAssessments: false, changes: [] });
+    return days.get(date);
+  };
+  for (const ev of classifiedEvents) {
+    if (ev.kind === 'event' || !ev.date) continue;
+    const dates = ev.kind === 'closure' && ev.allDay ? datesBetween(ev.start, ev.end) : [ev.date];
+    for (const date of dates) {
+      const d = day(date);
+      d.changes.push(ev.title);
+      if (ev.kind === 'closure') d.closed = true;
+      if (ev.kind === 'late-start') Object.assign(d, { lateStart: true, schoolStarts: ev.schoolStarts, schoolEnds: d.schoolEnds ?? null });
+      if (ev.kind === 'early-dismissal') Object.assign(d, { shortDay: true, schoolEnds: ev.schoolEnds });
+      if (ev.kind === 'special-schedule') d.blocks = ev.blocks;
+      if (ev.kind === 'no-assessments') d.noAssessments = true;
+    }
+  }
+  return [...days.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/**
+ * Edsby's timetable keeps the regular bell times on a changed day. Each period
+ * says how the day's change touches it; the new bell times themselves are not
+ * published, so none are invented.
+ */
+export function markPeriods(timetable, days, timeZone) {
+  const byDate = new Map(days.map((d) => [d.date, d]));
+  return timetable.map((t) => {
+    const d = byDate.get(localDateOf(t.start, timeZone));
+    if (!d) return { ...t, dayChanged: false };
+    const start = localClockOf(t.start, timeZone);
+    const end = localClockOf(t.end, timeZone);
+    const block = Number(/\d+/.exec(t.block)?.[0]);
+    // Only a closure or a special schedule that leaves a block out says a
+    // class does not meet. A 3:08 closing usually shortens every period
+    // rather than dropping the last, so a period past the new end is flagged
+    // for what it is, not called cancelled.
+    const cancelled = d.closed || (Array.isArray(d.blocks) && d.blocks.length > 0 && Number.isFinite(block) && !d.blocks.includes(block));
+    return {
+      ...t,
+      dayChanged: true,
+      cancelled,
+      pastSchoolHours: !cancelled && ((d.schoolEnds != null && start >= d.schoolEnds) || (d.schoolStarts != null && end <= d.schoolStarts)),
+      overlapsSchoolHours: !cancelled && ((d.schoolEnds != null && start < d.schoolEnds && end > d.schoolEnds) || (d.schoolStarts != null && start < d.schoolStarts && end > d.schoolStarts)),
+      // The times above are the regular bell times; the day's real ones differ.
+      regularTimes: true,
+    };
+  });
+}
+
+/** Class calendar entries that are work to have done by then. */
+const HOMEWORK = /\b(finish|read|complete|submit|hand\s+in|bring|prepare|study|review|due|before\s+class)\b/i;
+
 export function readCalendar(body) {
   const data = sliceData(body);
   const items = Object.values(data?.itemdata ?? {});
@@ -136,7 +239,8 @@ export function readCalendar(body) {
       });
     }
   }
-  return { timetable, events, work };
+  const scheduleName = Object.values(data?.schedules ?? {}).find((sc) => sc?.name)?.name ?? '';
+  return { timetable, events, work, scheduleName: String(scheduleName).trim() };
 }
 
 // ---------------------------------------------------------------------------
@@ -155,12 +259,18 @@ export function readPost(item, feedClassNid = null) {
   const files = content.bodycontent?.fileWrapper?.files?.init?.files ?? [];
   // Work a teacher assigns shows in the feed as an item with no text of its own.
   const assessment = content.bodycontent?.assessment;
+  // So does a class calendar entry ("Finish Part 1 of 1984 before class").
+  const eventDetails = content.bodycontent?.eventDetails;
+  const eventStart = eventDetails ? edsbyInstant(eventDetails.metadata?.sdate) : null;
+  const eventMinutes = Number(eventDetails?.metadata?.duration) / 60;
   const classNid = String(title.name?.message?.classnid ?? item?.pnid ?? feedClassNid ?? '');
   const text = htmlToText(html);
   return {
     nid: String(item?.nid ?? ''),
-    kind: assessment ? 'assessment' : 'post',
-    title: assessment ? String(assessment.type?.name ?? '').replace(/\s+/g, ' ').trim() : '',
+    kind: assessment ? 'assessment' : eventDetails ? 'event' : 'post',
+    title: String((assessment ?? eventDetails)?.type?.name ?? '').replace(/\s+/g, ' ').trim(),
+    eventStart,
+    eventEnd: eventStart && Number.isFinite(eventMinutes) && eventMinutes > 0 ? new Date(new Date(eventStart).getTime() + eventMinutes * 60_000).toISOString().replace('.000Z', 'Z') : null,
     dueAt: assessment ? edsbyInstant(assessment.onlinetestinfo?.testtimes?.duedate ?? assessment.type?.adate) : null,
     classNid,
     className: title.name?.message?.place ?? title.attendancename?.place ?? '',
@@ -687,6 +797,7 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
   const posts = new Map();
   const edsbyAssessments = [];
   const calendarWork = new Map();
+  let scheduleName = '';
   const libraryItems = new Map();
   const mywork = new Map();
 
@@ -710,6 +821,8 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
       }
       for (const ev of cal.events) events.set(ev.nid || `${ev.title}|${ev.start}`, ev);
       for (const w of cal.work) if (w.nid) calendarWork.set(w.nid, w);
+      if (view === 'CalendarPanel' && cal.scheduleName) scheduleName = cal.scheduleName;
+      else if (!scheduleName) scheduleName = cal.scheduleName;
     } else if (view === 'BaseActivity') {
       for (const item of Object.values(sliceData(body)?.body?.messages?.item ?? {})) {
         const p = readPost(item);
@@ -798,6 +911,11 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
   );
   const current = mergeAnnouncements(afterSupersede);
 
+  const classifiedEvents = [...events.values()]
+    .map((ev) => ({ ...ev, ...classifySchoolEvent(ev, timeZone) }))
+    .sort((a, b) => String(a.start).localeCompare(String(b.start)));
+  const schoolDays = readSchoolDays(classifiedEvents);
+
   // Each library entry learns its class by walking up through its parents.
   const classOf = (nid, depth = 0) => {
     if (classes.has(nid)) return nid;
@@ -812,9 +930,33 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
     schema: 1,
     host,
     normalizedAt: new Date(now).toISOString(),
-    classes: [...classes.values()].sort((a, b) => a.name.localeCompare(b.name)),
-    timetable: timetable.sort((a, b) => String(a.start).localeCompare(String(b.start))),
-    events: [...events.values()].sort((a, b) => String(a.start).localeCompare(String(b.start))),
+    // Edsby names some classes rather than coding them ("Grade 11 JH Block 1");
+    // the gradebook always carries the course code (JEH3D).
+    classes: [...classes.values()]
+      .map((c) => ({ ...c, courseCode: mywork.get(c.nid)?.courseCode || /^[A-Z]{3}\d[A-Z0-9]+/.exec(c.code)?.[0] || '' }))
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    today: (() => {
+      const date = localDateOf(new Date(now).toISOString(), timeZone);
+      const change = schoolDays.find((d) => d.date === date);
+      return { date, scheduleName, changed: Boolean(change), ...(change ?? {}), date };
+    })(),
+    days: schoolDays,
+    timetable: markPeriods(timetable, schoolDays, timeZone).sort((a, b) => String(a.start).localeCompare(String(b.start))),
+    events: classifiedEvents,
+    classEvents: postList
+      .filter((p) => p.kind === 'event' && p.eventStart)
+      .map((p) => ({
+        nid: p.nid,
+        classNid: p.classNid,
+        className: p.className,
+        title: p.title,
+        start: p.eventStart,
+        end: p.eventEnd,
+        date: localDateOf(p.eventStart, timeZone),
+        homework: HOMEWORK.test(p.title),
+        postedAt: p.postedAt,
+      }))
+      .sort((a, b) => String(a.start).localeCompare(String(b.start))),
     posts: postList,
     assessments: current.sort(byDate),
     supersededAssessments: superseded.sort(byDate),

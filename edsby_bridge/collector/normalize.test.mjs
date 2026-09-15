@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { edsbyInstant, htmlToText, localDateOf, mergeAnnouncements, normalizeCapture, readAssessmentDates, readClassFolder, readLessonSections, readMyWork, readPost, stripLayout, supersedeSchedules } from './normalize.mjs';
+import { classifySchoolEvent, edsbyInstant, htmlToText, localDateOf, mergeAnnouncements, normalizeCapture, readAssessmentDates, readClassFolder, readLessonSections, readMyWork, readPost, stripLayout, supersedeSchedules } from './normalize.mjs';
 
 // Shapes copied from real Edsby responses; the words are made up.
 const post = (text, postedAt = '2026-09-14T12:57:28Z', extra = {}) => ({ nid: 'p1', classNid: 'c1', className: 'Computer Science', postedAt, text, ...extra });
@@ -114,7 +114,7 @@ test('a lesson summary is recognised, and "Label: value" posts are not lessons',
 test("the class list is read from the level Edsby actually puts it at", () => {
   const body = { slices: [{ data: { classesContainer: { classes: { r1: { nid: 9, teacherNames: 'Ms. C', class: { myworkunread: 2, class: { core: { summary: { line1: { course: 'Physics Grade 11' }, info: { code: 'SPH3U-06' } } } } } } } } } }] };
   const n = normalizeCapture([{ status: 200, url: '/core/node.json/1?xds=BaseStudentClasses', body: JSON.stringify(body) }], { now: 0 });
-  assert.deepEqual(n.classes[0], { nid: '9', name: 'Physics Grade 11', code: 'SPH3U-06', teacher: 'Ms. C', unreadWork: 2 });
+  assert.deepEqual(n.classes[0], { nid: '9', name: 'Physics Grade 11', code: 'SPH3U-06', teacher: 'Ms. C', unreadWork: 2, courseCode: 'SPH3U' });
 });
 
 test('one period, even when a class calendar names it with a placeholder id', () => {
@@ -375,4 +375,75 @@ test('a mark, once entered, counts as graded and is passed on as sent', () => {
   const w = readMyWork(body, '9', { timeZone: 'America/Toronto' });
   assert.deepEqual(w.work[0].grade, { updatedAt: '2026-10-01T14:00:00Z', marked: true, marks: { k: '4' }, columns: { 0: '4' } });
   assert.equal(w.gradedCount, 1);
+});
+
+// ---- school events, class calendar entries, course codes: 15 September ----
+
+test('school events say what they do to the day', () => {
+  const tz = 'America/Toronto';
+  const c = (title, start, end, allDay = false) => classifySchoolEvent({ title, start, end, allDay }, tz);
+  assert.deepEqual(c('10:30am Start', '2026-09-16T14:30:00Z', '2026-09-16T20:30:00Z'), { kind: 'late-start', date: '2026-09-16', schoolStarts: '10:30', hours: { start: '10:30', end: '16:30' } });
+  assert.deepEqual(c('3:08pm Closing', '2026-09-15T12:30:00Z', '2026-09-15T19:08:00Z'), { kind: 'early-dismissal', date: '2026-09-15', schoolEnds: '15:08', hours: { start: '08:30', end: '15:08' } });
+  assert.equal(c('Noon dismissal ', '2026-09-25T12:30:00Z', '2026-09-25T16:00:00Z').schoolEnds, '12:00');
+  assert.deepEqual(c('Special Schedule blocks 1, 3, 5, 10', '2026-09-25', '2026-09-25', true), { kind: 'special-schedule', date: '2026-09-25', blocks: [1, 3, 5, 10] });
+  assert.deepEqual(c('Yom Kippur School Closed', '2026-09-21', '2026-09-21', true), { kind: 'closure', date: '2026-09-21' });
+  assert.equal(c('No Assessment Day', '2026-09-22', '2026-09-22', true).kind, 'no-assessments');
+  assert.deepEqual(c('Curriculum Night  7:30 PM', '2026-09-15', '2026-09-15', true), { kind: 'event', date: '2026-09-15', time: '19:30' });
+  assert.deepEqual(c('Terry Fox Walk', '2026-09-24', '2026-09-24', true), { kind: 'event', date: '2026-09-24', time: null });
+});
+
+test('a class calendar entry in the feed becomes a dated class event, and reading becomes homework', () => {
+  const classes = JSON.stringify({ slices: [{ data: { classesContainer: { classes: {
+    r: { nid: 351, class: { class: { core: { summary: { line1: { course: 'English' }, info: { code: 'ENG3U-11' } } } } } },
+    j: { nid: 774, class: { class: { core: { summary: { line1: { course: 'Grade 11 JH Block 1' }, info: { code: 'Grade 11 JH Block 1' } } } } } },
+  } } } }] });
+  const feed = JSON.stringify({ slices: [{ data: { item: { r1: { nid: 500, creatorType: 'Teacher', creator: { user: 'Mr. A' }, nodesubtype: 2, itembody: { content: {
+    header: { details: { date: '2026-09-10 21:08:54', title: { attendancename: { place: 'English' } } } },
+    bodycontent: { eventDetails: { type: { name: 'Finish Part 1 of 1984 before class (Page 107 in Penguin edition)' }, metadata: { sdate: '2026-10-19 14:40:00', duration: 3600 } } },
+  } } } } } }] });
+  const jh = JSON.stringify({ slices: [{ data: { loaddata: { grades: {}, gradebook: { CourseID: 'JEH3D', terms: {} } } } }] });
+  const cal = JSON.stringify({ slices: [{ data: { schedules: { a: { nid: -100, name: 'Tuesday' }, b: { nid: -101 } }, itemdata: {} } }] });
+  const n = normalizeCapture([
+    { status: 200, url: '/core/node.json/1?xds=BaseStudentClasses', body: classes },
+    { status: 200, url: '/core/node.json/351?xds=CourseFeed', body: feed },
+    { status: 200, url: '/core/node.json/774?xds=MyWork&MyWork_active=assessments', body: jh },
+    { status: 200, url: '/core/node.json/170?xds=CalendarPanel', body: cal },
+  ], { now: Date.parse('2026-09-15T16:00:00Z'), timeZone: 'America/Toronto' });
+  assert.deepEqual(n.classEvents, [{
+    nid: '500', classNid: '351', className: 'English', title: 'Finish Part 1 of 1984 before class (Page 107 in Penguin edition)',
+    start: '2026-10-19T14:40:00Z', end: '2026-10-19T15:40:00Z', date: '2026-10-19', homework: true, postedAt: '2026-09-10T21:08:54Z',
+  }]);
+  assert.equal(n.posts[0].kind, 'event');
+  assert.deepEqual(n.classes.map((x) => [x.code, x.courseCode]), [['ENG3U-11', 'ENG3U'], ['Grade 11 JH Block 1', 'JEH3D']]);
+  assert.deepEqual(n.today, { date: '2026-09-15', scheduleName: 'Tuesday', changed: false });
+});
+
+test('a short day is recognised, and the periods after dismissal are flagged', () => {
+  const tz = 'America/Toronto';
+  const period = (block, start, end) => ({ classNid: block, code: `C${block}`, block: `Block ${block}`, start, end });
+  const cal = JSON.stringify({ slices: [{ data: { schedules: { a: { name: 'Tuesday' } }, itemdata: {
+    t2: { nodetype: 6, nodesubtype: 13, nid: 2, name: 'C2', periodName: ['Block 2'], sdate: '2026-09-15 12:30:00', edate: '2026-09-15 13:29:00' },
+    t10: { nodetype: 6, nodesubtype: 13, nid: 10, name: 'C10', periodName: ['Block 10'], sdate: '2026-09-15 18:26:00', edate: '2026-09-15 19:25:00' },
+    t12: { nodetype: 6, nodesubtype: 13, nid: 12, name: 'C12', periodName: ['Block 12'], sdate: '2026-09-15 19:31:00', edate: '2026-09-15 20:30:00' },
+    e1: { nodetype: 6, nodesubtype: 2, nid: 90, name: '3:08pm Closing', allday: 0, sdate: '2026-09-15 12:30:00', edate: '2026-09-15 19:08:00' },
+    e2: { nodetype: 6, nodesubtype: 2, nid: 91, name: 'Yom Kippur School Closed', allday: 1, sdate: '2026-09-21', edate: '2026-09-21' },
+    e3: { nodetype: 6, nodesubtype: 2, nid: 92, name: 'Special Schedule blocks 1, 3, 5, 10', allday: 1, sdate: '2026-09-25', edate: '2026-09-25' },
+    e4: { nodetype: 6, nodesubtype: 2, nid: 93, name: 'Noon dismissal ', allday: 0, sdate: '2026-09-25 12:30:00', edate: '2026-09-25 16:00:00' },
+    e5: { nodetype: 6, nodesubtype: 2, nid: 94, name: 'CLUB FAIR', allday: 1, sdate: '2026-09-18', edate: '2026-09-18' },
+  } } }] });
+  const n = normalizeCapture([{ status: 200, url: '/core/node.json/170?xds=CalendarPanel', body: cal }], { now: Date.parse('2026-09-15T14:00:00Z'), timeZone: tz });
+  assert.equal(n.today.changed, true);
+  assert.equal(n.today.shortDay, true);
+  assert.equal(n.today.schoolEnds, '15:08');
+  assert.deepEqual(n.today.changes, ['3:08pm Closing']);
+  assert.deepEqual(n.timetable.map((t) => [t.block, t.cancelled, t.overlapsSchoolHours, t.pastSchoolHours, t.regularTimes]), [
+    ['Block 2', false, false, false, true],
+    ['Block 10', false, true, false, true],
+    ['Block 12', false, false, true, true],
+  ], 'a short day moves the bells; it does not cancel the last class');
+  assert.deepEqual(n.days.map((d) => [d.date, d.closed, d.shortDay, d.schoolEnds, d.blocks]), [
+    ['2026-09-15', false, true, '15:08', null],
+    ['2026-09-21', true, false, null, null],
+    ['2026-09-25', false, true, '12:00', [1, 3, 5, 10]],
+  ]);
 });
