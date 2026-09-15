@@ -232,7 +232,7 @@ test('a file three folders deep still belongs to its class', () => {
   assert.ok(n.library.every((i) => i.classNid === '5'));
 });
 
-test('My Work separates units from work, and passes grades through untouched', () => {
+test('My Work separates units from work, and keeps grades as sent', () => {
   const body = { slices: [{ data: { nid: 5, courseTitle: 'ENG3U-11', loaddata: {
     grades: { g1: { anything: 'as Edsby sends it' } },
     gradebook: {
@@ -251,9 +251,9 @@ test('My Work separates units from work, and passes grades through untouched', (
   assert.equal(w.work.length, 1);
   assert.deepEqual(
     { ...w.work[0] },
-    { nid: '71', name: 'Literary Paragraph', category: 'Unit 1: Short Stories', type: '', assignedDate: '2026-10-05', dueDate: '2026-10-16', dueAt: '2026-10-16T20:00:00Z', dateSet: true, placeholder: false, ongoing: false, summative: true, outOf: 100, weight: 10, submitsOnline: false }
+    { nid: '71', name: 'Literary Paragraph', category: 'Unit 1: Short Stories', type: '', assignedDate: '2026-10-05', dueDate: '2026-10-16', dueAt: '2026-10-16T20:00:00Z', dateSet: true, placeholder: false, ongoing: false, summative: true, outOf: 100, weight: 10, submitsOnline: false, submittedAt: null, grade: null }
   );
-  assert.equal(w.gradedCount, 1);
+  assert.equal(w.gradedCount, 0, 'a record for an id that is not this work is not a mark');
   assert.deepEqual(w.grades, { g1: { anything: 'as Edsby sends it' } });
   assert.equal(w.curriculum, undefined, 'curriculum expectations are not sent');
   assert.ok(!stripLayout(JSON.stringify(body)).includes('learningstandards'));
@@ -324,4 +324,55 @@ test('Edsby due times become the local day they fall on', () => {
   assert.equal(localDateOf('2026-10-17T01:30:00Z', 'America/Toronto'), '2026-10-16', '9:30 PM the evening before in Toronto');
   assert.equal(localDateOf('2027-03-04T14:31:00Z', 'America/Toronto'), '2027-03-04');
   assert.equal(localDateOf(null, 'America/Toronto'), null);
+});
+
+// ---- from the 0.5.0 data, 15 September: the first published assignment ----
+
+test('published work due the same day it was set: one assessment, on its due date, with its submission', () => {
+  const classes = JSON.stringify({ slices: [{ data: { classesContainer: { classes: { r: { nid: 689, class: { class: { core: { summary: { line1: { course: 'Computer Science' }, info: { code: 'ICS4UG-01' } } } } } } } } } }] });
+  const term = { nid: 328, esubmit: 1, cdate: '2026-09-15 12:51:11', sdate: '2026-09-07 13:30:00', date: '2026-09-15 13:30:00', duedate: '2026-09-15 13:30:00', columns: { 0: 5 }, name: 'AverageDensity', thread: 793, weighting: { 0: 5 }, summative: '0', type: '15', nodetype: 6, nodesubtype: 3 };
+  const mywork = JSON.stringify({ slices: [{ data: { nid: 689, loaddata: {
+    grades: { 328: { e: '2026-09-15 13:08:19', la: 1, r: '1', cols: {}, g: {} } },
+    gradebook: { CourseID: 'ICS4UG', terms: {
+      u: { nid: 793, name: 'Unit 1', nodesubtype: 4 },
+      w: term,
+      p: { nid: 329, cdate: '2026-09-10 19:22:36', date: '2026-09-10 19:21:20', duedate: '2026-09-10 19:21:20', name: 'Exam Placeholder', thread: 793, nodesubtype: 3 },
+    } },
+  }, other: { x: { nid: 328, submitButton: { calc: { submitted: '2026-09-15 13:08:20', button: 2 } } } } } }] });
+  const calItem = { nid: 328, type: 6, subtype: 3, pnid: 689, name: 'AverageDensity', sdate: '2026-09-07 13:30:00', duedate: '2026-09-15 13:30:00', completeddate: '2026-09-15 13:08:20', assessmentType: '15', assessmentESubmit: { submitted: '2026-09-15 13:08:20', button: 2 }, nodetype: 6, nodesubtype: 10 };
+  const calendar = JSON.stringify({ slices: [{ data: { itemdata: { r1: calItem } } }] });
+  const feed = JSON.stringify({ slices: [{ data: { item: { r1: { nid: 328, creatorType: 'Teacher', creator: { user: 'Mr. R' }, nodesubtype: 3, itembody: { content: {
+    header: { details: { date: '2026-09-15 12:51:11', title: { attendancename: { place: 'Computer Science' } } } },
+    bodycontent: { assessment: { type: { type: '15', name: 'AverageDensity', adate: '2026-09-15 13:30:00' }, onlinetestinfo: { testtimes: { sdate: '2026-09-07 13:30:00', duedate: '2026-09-15 13:30:00' } } } },
+  } } } } } }] });
+  const n = normalizeCapture([
+    { status: 200, url: '/core/node.json/1?xds=BaseStudentClasses', body: classes },
+    { status: 200, url: '/core/node.json/689?xds=MyWork&MyWork_active=assessments', body: mywork },
+    { status: 200, url: '/core/node.json/689?xds=CalendarPanel_Class', body: calendar },
+    { status: 200, url: '/core/node.json/170?xds=CalendarPanel', body: calendar },
+    { status: 200, url: '/core/node.json/689?xds=CourseFeed', body: feed },
+  ], { now: 0, timeZone: 'America/Toronto' });
+  assert.deepEqual(
+    n.assessments.map((a) => [a.source, a.workNid, a.label, a.date, a.dueAt, a.className, a.category, a.submittedAt]),
+    [['edsby', '328', 'AverageDensity', '2026-09-15', '2026-09-15T13:30:00Z', 'Computer Science', 'Unit 1', '2026-09-15T13:08:20Z']]
+  );
+  const w = n.mywork[0].work.find((x) => x.nid === '328');
+  assert.equal(w.dateSet, true, '39 minutes after it was set is still a real due time');
+  assert.deepEqual(w.grade, { updatedAt: '2026-09-15T13:08:19Z', marked: false, marks: null, columns: null });
+  assert.equal(n.mywork[0].gradedCount, 0, 'handed in, not yet marked');
+  assert.equal(n.mywork[0].work.find((x) => x.nid === '329').dateSet, false);
+  const post = n.posts.find((p) => p.nid === '328');
+  assert.deepEqual([post.kind, post.title, post.dueAt], ['assessment', 'AverageDensity', '2026-09-15T13:30:00Z']);
+  const undated = n.posts.find((p) => p.nid === '329');
+  assert.equal(undated, undefined);
+});
+
+test('a mark, once entered, counts as graded and is passed on as sent', () => {
+  const body = { slices: [{ data: { loaddata: {
+    grades: { 5: { e: '2026-10-01 14:00:00', cols: { 0: '4' }, g: { k: '4' } } },
+    gradebook: { terms: { a: { nid: 5, name: 'Quiz', nodesubtype: 3, cdate: '2026-09-01 12:00:00', duedate: '2026-09-20 12:00:00' } } },
+  } } }] };
+  const w = readMyWork(body, '9', { timeZone: 'America/Toronto' });
+  assert.deepEqual(w.work[0].grade, { updatedAt: '2026-10-01T14:00:00Z', marked: true, marks: { k: '4' }, columns: { 0: '4' } });
+  assert.equal(w.gradedCount, 1);
 });

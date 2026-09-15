@@ -98,7 +98,7 @@ export function readCalendar(body) {
   const items = Object.values(data?.itemdata ?? {});
   const timetable = [];
   const events = [];
-  const assessments = [];
+  const work = [];
   for (const it of items) {
     const type = `${it.nodetype}/${it.nodesubtype}`;
     if (type === '6/13') {
@@ -122,20 +122,21 @@ export function readCalendar(body) {
         end: allDay ? edsbyDate(it.edate) : edsbyInstant(it.edate),
       });
     }
-    // An assessment Edsby itself knows about, when a teacher enters one.
-    if (it.assessmentType != null && String(it.assessmentType) !== '0') {
-      assessments.push({
-        source: 'edsby',
-        classNid: String(it.pnid ?? it.nid ?? ''),
-        label: String(it.name ?? it.Title ?? 'Assessment').trim(),
-        date: edsbyDate(String(it.sdate ?? '')) ?? String(it.sdate ?? '').slice(0, 10),
-        precision: 'day',
-        tentative: false,
-        evidence: '',
+    // Work a teacher published to the class, as the calendar shows it. Its
+    // "sdate" is when it opened, not when it is due: the first version used
+    // it as the date, and listed the item once per calendar it appeared on.
+    if (it.assessmentType != null && String(it.assessmentType) !== '0' && it.duedate) {
+      work.push({
+        nid: String(it.nid ?? ''),
+        classNid: String(it.pnid ?? ''),
+        name: String(it.name ?? it.Title ?? 'Assessment').replace(/\s+/g, ' ').trim(),
+        assignedAt: edsbyInstant(it.sdate),
+        dueAt: edsbyInstant(it.duedate),
+        submittedAt: edsbyInstant(it.assessmentESubmit?.submitted ?? it.completeddate),
       });
     }
   }
-  return { timetable, events, assessments };
+  return { timetable, events, work };
 }
 
 // ---------------------------------------------------------------------------
@@ -152,10 +153,15 @@ export function readPost(item, feedClassNid = null) {
     content.bodycontent?.learningdestinationattainment?.attainmentBody?.attainmentbody ??
     '';
   const files = content.bodycontent?.fileWrapper?.files?.init?.files ?? [];
+  // Work a teacher assigns shows in the feed as an item with no text of its own.
+  const assessment = content.bodycontent?.assessment;
   const classNid = String(title.name?.message?.classnid ?? item?.pnid ?? feedClassNid ?? '');
   const text = htmlToText(html);
   return {
     nid: String(item?.nid ?? ''),
+    kind: assessment ? 'assessment' : 'post',
+    title: assessment ? String(assessment.type?.name ?? '').replace(/\s+/g, ' ').trim() : '',
+    dueAt: assessment ? edsbyInstant(assessment.onlinetestinfo?.testtimes?.duedate ?? assessment.type?.adate) : null,
     classNid,
     className: title.name?.message?.place ?? title.attendancename?.place ?? '',
     author: item?.creator?.user ?? '',
@@ -557,6 +563,31 @@ export function localDateOf(instant, timeZone) {
   return `${get('year')}-${get('month')}-${get('day')}`;
 }
 
+function walk(value, visit, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 12) return;
+  if (!Array.isArray(value)) visit(value);
+  for (const v of Object.values(value)) walk(v, visit, depth + 1);
+}
+
+function hasEntries(value) {
+  return Boolean(value && typeof value === 'object' && Object.keys(value).length);
+}
+
+/**
+ * One item's grade record. The first one seen (a submitted Computer Science
+ * assignment) was `{e, la, r, cols: {}, g: {}}`: a record exists once work is
+ * handed in, and the marks go in `g` and `cols`, empty until marked. Marks
+ * are passed on as they come, since a real one has not been seen yet.
+ */
+function readGrade(record) {
+  return {
+    updatedAt: edsbyInstant(record.e),
+    marked: hasEntries(record.g) || hasEntries(record.cols),
+    marks: hasEntries(record.g) ? record.g : null,
+    columns: hasEntries(record.cols) ? record.cols : null,
+  };
+}
+
 /** Ongoing marks with a nominal date: not something to put on a calendar. */
 const ONGOING = /^(participation|attendance|engagement|class conduct)\b/i;
 
@@ -569,9 +600,8 @@ function oneLine(text) {
  * been graded. Edsby also sends the curriculum expectations each class maps
  * to; they are left out, because the classes do not follow them closely.
  *
- * Grades are passed through as Edsby sends them, not interpreted: none had
- * been entered when this was written, so their shape has never been seen, and
- * guessing at a mark would be worse than handing it over untouched.
+ * Grades stay as Edsby sends them in `grades`, and each piece of work also
+ * gets its own record's plain facts (see readGrade).
  */
 export function readMyWork(body, classNid, { timeZone = 'UTC' } = {}) {
   const data = sliceData(body);
@@ -579,11 +609,18 @@ export function readMyWork(body, classNid, { timeZone = 'UTC' } = {}) {
   const gb = load.gradebook ?? {};
   const grades = load.grades && typeof load.grades === 'object' ? load.grades : {};
   const terms = Object.values(gb.terms ?? {});
+  const submissions = new Map();
+  walk(data, (o) => {
+    const at = edsbyInstant(o.submitButton?.calc?.submitted);
+    if (o.nid != null && at) submissions.set(String(o.nid), at);
+  });
   // Edsby's "terms" hold two different things: categories and units
   // (subtype 4: "Unit 1: Short Stories", "ISA", "Exam") and the pieces of
   // work inside them (subtype 3: "Literary Paragraph", "Test 1"). The first
   // version read all of them as units.
   const categories = new Map(terms.filter((t) => String(t.nodesubtype) === '4').map((t) => [String(t.nid), oneLine(t.name)]));
+  // A unit named "NA" is a teacher's way of saying there is no unit.
+  const categoryName = (nid) => (/^(n\/?a|none|-+)$/i.test(categories.get(nid) ?? '') ? '' : categories.get(nid) ?? '');
   const work = terms
     .filter((t) => String(t.nodesubtype) === '3')
     .map((t) => {
@@ -591,16 +628,18 @@ export function readMyWork(body, classNid, { timeZone = 'UTC' } = {}) {
       const dueAt = edsbyInstant(t.duedate) ?? edsbyInstant(t.date);
       const assignedAt = edsbyInstant(t.sdate);
       // An item the teacher never dated carries its own creation moment as
-      // its date, to within a minute; a real date sits days or weeks later.
-      const dateSet = Boolean(dueAt && created) && Math.abs(new Date(dueAt) - new Date(created)) >= 24 * 3_600_000;
+      // its date, a minute or two before it. A real date comes after, and can
+      // be the same day: "AverageDensity" was due 39 minutes after it was set.
+      const dateSet = Boolean(dueAt && created) && new Date(dueAt) - new Date(created) >= 10 * 60_000;
       const name = oneLine(t.name);
-      const categoryNid = String(t.fraction ?? '').split('/')[0];
+      const categoryNid = [String(t.fraction ?? '').split('/')[0], String(t.thread ?? '')].find((nid) => categories.has(nid)) ?? '';
+      const grade = grades[String(t.nid)];
       const outOf = Number(Object.values(t.columns ?? {})[0]);
       const weight = Number(Object.values(t.weighting ?? {})[0]);
       return {
         nid: String(t.nid ?? ''),
         name,
-        category: categories.get(categoryNid) ?? '',
+        category: categoryName(categoryNid),
         type: /^\d+$/.test(String(t.type ?? '')) ? '' : oneLine(t.type),
         assignedDate: localDateOf(assignedAt, timeZone),
         dueDate: dateSet ? localDateOf(dueAt, timeZone) : null,
@@ -612,6 +651,8 @@ export function readMyWork(body, classNid, { timeZone = 'UTC' } = {}) {
         outOf: Number.isFinite(outOf) ? outOf : null,
         weight: Number.isFinite(weight) ? weight : null,
         submitsOnline: String(t.esubmit) === '1',
+        submittedAt: submissions.get(String(t.nid)) ?? null,
+        grade: grade && typeof grade === 'object' ? readGrade(grade) : null,
       };
     })
     .sort((a, b) => String(a.dueDate ?? '9999').localeCompare(String(b.dueDate ?? '9999')));
@@ -622,7 +663,7 @@ export function readMyWork(body, classNid, { timeZone = 'UTC' } = {}) {
     units: [...categories.entries()].map(([nid, name]) => ({ nid, name })),
     work,
     strands: (gb.strands ?? []).map((st) => ({ key: st.key ?? '', name: st.name ?? '' })),
-    gradedCount: Object.keys(grades).length,
+    gradedCount: work.filter((w) => w.grade?.marked).length,
     grades,
   };
 }
@@ -645,6 +686,7 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
   const events = new Map();
   const posts = new Map();
   const edsbyAssessments = [];
+  const calendarWork = new Map();
   const libraryItems = new Map();
   const mywork = new Map();
 
@@ -667,7 +709,7 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
         else if (Number(twin.classNid) < 0 && Number(t.classNid) > 0) twin.classNid = t.classNid;
       }
       for (const ev of cal.events) events.set(ev.nid || `${ev.title}|${ev.start}`, ev);
-      edsbyAssessments.push(...cal.assessments);
+      for (const w of cal.work) if (w.nid) calendarWork.set(w.nid, w);
     } else if (view === 'BaseActivity') {
       for (const item of Object.values(sliceData(body)?.body?.messages?.item ?? {})) {
         const p = readPost(item);
@@ -692,9 +734,13 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
   const byCode = new Map([...classes.values()].map((c) => [c.code, c.nid]));
   for (const t of timetable) if (Number(t.classNid) < 0 && byCode.has(t.code)) t.classNid = byCode.get(t.code);
 
+  // An assignment's feed item takes its due time from the gradebook, which
+  // knows when there is none: an undated item's own copy shows its creation.
+  const workByNid = new Map([...mywork.values()].flatMap((w) => w.work.map((item) => [item.nid, item])));
   const postList = [...posts.values()]
     .map((p) => ({
       ...p,
+      ...(p.kind === 'assessment' && workByNid.has(p.nid) ? { dueAt: workByNid.get(p.nid).dueAt } : {}),
       className: p.className || classes.get(p.classNid)?.name || '',
       files: p.files.map((f) => ({ ...f, stored: storedFiles.has(f.nid) })),
     }))
@@ -703,20 +749,18 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
   // Work a teacher dated in the gradebook is the firmest date there is: its
   // own due time, weight and category. Undated items, placeholders and
   // ongoing marks (participation, attendance) stay in mywork[].work only.
-  for (const w of mywork.values()) {
-    for (const item of w.work) {
-      if (!item.dateSet || item.placeholder || item.ongoing) continue;
-      edsbyAssessments.push({
+  const toAssessment = (classNid, item) => ({
         source: 'edsby',
         workNid: item.nid,
-        classNid: w.classNid,
-        className: classes.get(w.classNid)?.name ?? '',
+        classNid,
+        className: classes.get(classNid)?.name ?? '',
         label: item.name,
-        category: item.category,
+        category: item.category ?? '',
         topic: '',
         date: item.dueDate,
         dueAt: item.dueAt,
         assignedDate: item.assignedDate,
+        submittedAt: item.submittedAt ?? null,
         alternatives: [],
         precision: 'day',
         tentative: false,
@@ -728,7 +772,25 @@ export function normalizeCapture(responses, { host = '', now = Date.now(), store
         heading: '',
         evidence: '',
       });
+  const seenWork = new Set();
+  for (const w of mywork.values()) {
+    for (const item of w.work) {
+      // A calendar entry is the teacher publishing the due time.
+      const cal = calendarWork.get(item.nid);
+      if (cal?.dueAt && !item.dateSet) Object.assign(item, { dateSet: true, dueAt: cal.dueAt, dueDate: localDateOf(cal.dueAt, timeZone) });
+      if (cal?.submittedAt && !item.submittedAt) item.submittedAt = cal.submittedAt;
+      if (!item.dateSet || item.placeholder || item.ongoing) continue;
+      seenWork.add(item.nid);
+      edsbyAssessments.push(toAssessment(w.classNid, item));
     }
+  }
+  // Published work whose class gradebook was not captured.
+  for (const cal of calendarWork.values()) {
+    if (seenWork.has(cal.nid)) continue;
+    edsbyAssessments.push(toAssessment(cal.classNid, {
+      nid: cal.nid, name: cal.name, dueAt: cal.dueAt, dueDate: localDateOf(cal.dueAt, timeZone),
+      assignedDate: localDateOf(cal.assignedAt, timeZone), submittedAt: cal.submittedAt, summative: false, weight: null, outOf: null,
+    }));
   }
   const { current: afterSupersede, superseded } = supersedeSchedules(
     [...edsbyAssessments, ...postList.flatMap(readAssessmentDates)],
