@@ -35,7 +35,7 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.5.2';
+const VERSION = '0.5.3';
 const TIME_ZONE = process.env.TZ || 'America/Toronto';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
@@ -55,6 +55,15 @@ const MAX_TOTAL = 3_500_000;
 const SETTLE_MS = 20_000;
 
 const log = (...args) => console.log(`[edsby-bridge ${new Date().toISOString()}]`, ...args);
+
+// A promise nobody caught must not take the browser down with it: the
+// session lives in the profile, but everything captured since the last look
+// would go, and the next look is up to three hours away.
+process.on('unhandledRejection', (err) => log(`unhandled: ${err?.stack ?? err}`));
+process.on('uncaughtException', (err) => {
+  log(`crashed: ${err?.stack ?? err}`);
+  process.exit(1); // run.sh starts it again with the same profile
+});
 
 if (!HOST) {
   log('No Edsby address set. Add it in the add-on Configuration tab.');
@@ -262,11 +271,20 @@ async function push(reason) {
     return;
   }
   try {
-    const res = await fetch(`${RELAY}/edsby/${encodeURIComponent(SECRET)}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'user-agent': `edsby-bridge/${VERSION}` },
-      body: JSON.stringify(payload),
-    });
+    const send = (body) =>
+      fetch(`${RELAY}/edsby/${encodeURIComponent(SECRET)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'user-agent': `edsby-bridge/${VERSION}` },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(90_000),
+      });
+    let res = await send(payload);
+    if (res.status === 413 && responses.length > 0) {
+      // Too big with the raw responses in it: the normalized part is what
+      // the apps read, and it must not be lost for the sake of the rest.
+      log(`capture too large for the relay (${Math.round(bytes / 1024)} KB); sending the normalized part alone`);
+      res = await send({ ...payload, responses: [], responseCount: 0, rawOmitted: true });
+    }
     if (!res.ok) {
       log(`relay refused the capture: ${res.status} ${await res.text().catch(() => '')}`);
       return;
@@ -318,7 +336,23 @@ setInterval(() => void updateSignedIn('check'), 30_000);
  * navigated away from what they are doing; it loads Edsby's home, which
  * fetches the feed and classes, and closes again.
  */
+let looking = false;
 async function refresh() {
+  // One look at a time: a slow library or a stalled download must not have
+  // the next scheduled look open a second tab beside it.
+  if (looking) {
+    log('a look is still running; not starting another');
+    return;
+  }
+  looking = true;
+  try {
+    await refreshOnce();
+  } finally {
+    looking = false;
+  }
+}
+
+async function refreshOnce() {
   if (!(await updateSignedIn('scheduled look'))) {
     log('not signed in; skipping the regular look');
     await push('status');
