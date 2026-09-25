@@ -35,7 +35,7 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.5.3';
+const VERSION = '0.5.4';
 const TIME_ZONE = process.env.TZ || 'America/Toronto';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
@@ -482,7 +482,9 @@ const storedFiles = new Map(
 );
 let lastDownloadLog = [];
 
-const MAX_FILE_BYTES = 20_000_000;
+// The Home Assistant relay stores files up to 16 MB. Anything larger is left
+// for Edsby rather than fetched, refused, and fetched again every look.
+const MAX_FILE_BYTES = 16_000_000;
 const MAX_FILES_PER_LOOK = 60;
 const MAX_BYTES_PER_LOOK = 150_000_000;
 

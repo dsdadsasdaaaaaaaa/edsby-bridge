@@ -5,9 +5,11 @@ your classes post — feeds, assignments, tests, calendar — to your DayFlow re
 
 ## Setting it up
 
-1. **Configuration tab.** Paste your relay secret into `relay_secret` and save.
+1. **Configuration tab.** Paste the relay's **edsby** secret into `relay_secret` and save.
    `edsby_host` is your school's Edsby address (for TanenbaumCHAT,
-   `tchat.edsby.com`). Leave `relay_url` as it is.
+   `tchat.edsby.com`). `relay_url` defaults to the relay inside Home Assistant,
+   `http://homeassistant:8123/api/eduassist/relay`; change it only if your relay
+   runs somewhere else.
 2. **Start** the add-on. The first start builds it on your server, which takes a
    few minutes, longer on a Raspberry Pi.
 3. **Sign in.** Open the **Edsby** panel in the sidebar (or *Open Web UI*). You

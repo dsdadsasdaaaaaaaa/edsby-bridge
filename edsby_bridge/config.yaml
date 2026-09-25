@@ -1,5 +1,5 @@
 name: Edsby Bridge
-version: "0.5.3"
+version: "0.5.4"
 slug: edsby_bridge
 description: Keeps a signed-in Edsby session and sends what your classes post to DayFlow.
 arch:
@@ -14,7 +14,7 @@ panel_icon: mdi:school
 panel_title: Edsby
 options:
   edsby_host: tchat.edsby.com
-  relay_url: https://dayflow-inbox.giveawaybot1225.workers.dev
+  relay_url: http://homeassistant:8123/api/eduassist/relay
   relay_secret: ""
   interval_minutes: 180
 schema:
