@@ -35,7 +35,7 @@ const CHROMIUM_VERSION = await fs
 const OPTIONS_FILE = process.env.OPTIONS_FILE ?? '/data/options.json';
 const PROFILE_DIR = process.env.PROFILE_DIR ?? '/data/profile';
 const HEADLESS = process.env.HEADLESS === '1';
-const VERSION = '0.5.4';
+const VERSION = '0.5.5';
 const TIME_ZONE = process.env.TZ || 'America/Toronto';
 
 const options = JSON.parse(await fs.readFile(OPTIONS_FILE, 'utf8'));
@@ -240,6 +240,28 @@ async function notifyHomeAssistant(signedOut) {
 
 let lastFetchLog = [];
 
+/**
+ * A request to the relay, given one second try.
+ *
+ * The relay answers 503 for a moment while Home Assistant reloads it, and
+ * since its 1.2.0 a fault of its own answers 500. Either used to cost the
+ * whole capture until the next look, up to three hours later. Only for
+ * requests that replace what the relay holds, so sending one twice changes
+ * nothing.
+ */
+async function relayFetch(url, init) {
+  const attempt = () => fetch(url, { ...init, signal: AbortSignal.timeout(90_000) });
+  try {
+    const res = await attempt();
+    if (![500, 502, 503, 504].includes(res.status)) return res;
+    log(`relay answered ${res.status}; trying once more`);
+  } catch (err) {
+    log(`could not reach the relay (${err?.message ?? err}); trying once more`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5_000));
+  return attempt();
+}
+
 async function push(reason) {
   const page = context.pages()[0];
   const all = signedIn ? [...captured.values()].reverse() : [];
@@ -272,11 +294,10 @@ async function push(reason) {
   }
   try {
     const send = (body) =>
-      fetch(`${RELAY}/edsby/${encodeURIComponent(SECRET)}`, {
+      relayFetch(`${RELAY}/edsby/${encodeURIComponent(SECRET)}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'user-agent': `edsby-bridge/${VERSION}` },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(90_000),
       });
     let res = await send(payload);
     if (res.status === 413 && responses.length > 0) {
@@ -527,7 +548,7 @@ async function storeNewFiles() {
         if (/text\/html/i.test(type)) break;
         continue;
       }
-      const put = await fetch(`${RELAY}/edsby/file/${encodeURIComponent(SECRET)}/${nid}`, {
+      const put = await relayFetch(`${RELAY}/edsby/file/${encodeURIComponent(SECRET)}/${nid}`, {
         method: 'PUT',
         headers: {
           'content-type': meta.type || type || 'application/octet-stream',
